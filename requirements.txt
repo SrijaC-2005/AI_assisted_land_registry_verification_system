@@ -1,0 +1,6 @@
+Flask
+pandas
+numpy
+joblib
+quantcrypt
+werkzeug
