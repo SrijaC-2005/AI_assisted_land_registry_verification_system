@@ -205,9 +205,11 @@ class Network:
         self.pending_users: Dict[str, List[str]] = {} # {username: [voter1, voter2, ...]}
         self.add_node('Node-A', is_initial=True)
         self.create_genesis_block()
+
     def check_duplicate_transaction(self, tx):
 
         land_id = tx["land_id"]
+        document_hash = tx["document_hash"]
         seller = tx["old_owner"]
         buyer = tx["new_owner"]
 
@@ -216,42 +218,48 @@ class Network:
         # -------------------------
         for pending in self.pending_transactions:
 
-            if pending["land_id"] == land_id:
+            # Same Land ID
+            if pending.get("land_id") == land_id:
                 return False, "Land ID already exists in Pending Queue."
 
-            if (pending["old_owner"] == seller and
-                pending["new_owner"] == buyer and
-                pending["land_id"] == land_id):
-                return False, "Same buyer/seller transaction already exists in Pending Queue."
+            # Same Document
+            if pending.get("document_hash") == document_hash:
+                return False, "This document is already used in another transaction."
 
+            # Same buyer/seller transaction
+            if (
+                pending.get("old_owner") == seller
+                and pending.get("new_owner") == buyer
+                and pending.get("land_id") == land_id
+            ):
+                return False, "Same transaction already exists in Pending Queue."
 
         # -------------------------
         # Check Blockchain Ledger
         # -------------------------
         for block in self.chain:
-            print(type(block))
-            print(block)
-            print(block.__dict__)
-            print("Checking Block:", block.index)
 
             for ledger_tx in block.transactions:
 
-                print("Ledger Land ID =", ledger_tx.get("land_id"))
-                print("Incoming Land ID =", land_id)
-
+                # Ignore Genesis Block
                 if "land_id" not in ledger_tx:
                     continue
 
-                if ledger_tx["land_id"] == land_id:
-                    print("MATCH FOUND")
+                # Same Land ID
+                if ledger_tx.get("land_id") == land_id:
                     return False, "Land ID already exists in Ledger."
 
+                # Same Document Hash
+                if ledger_tx.get("document_hash") == document_hash:
+                    return False, "This document is already registered in the Ledger."
+
+                # Same complete transaction
                 if (
-                    ledger_tx["old_owner"] == seller
-                    and ledger_tx["new_owner"] == buyer
-                    and ledger_tx["land_id"] == land_id
+                    ledger_tx.get("old_owner") == seller
+                    and ledger_tx.get("new_owner") == buyer
+                    and ledger_tx.get("land_id") == land_id
                 ):
-                    return False, "Same buyer/seller transaction already exists in Ledger."
+                    return False, "Same transaction already exists in Ledger."
 
         return True, "No duplicates."
 
@@ -330,25 +338,38 @@ class Network:
 
     def run_pow(self, proposer_node: str) -> Block:
         last_block = self.get_last_block()
+
+        # Take ONLY the first pending transaction
+        tx = self.pending_transactions[0]
+
         new_block = Block(
             index=last_block.index + 1,
             timestamp=time.time(),
-            transactions=[self.pending_transactions[0]],
+            transactions=[tx],
             previous_hash=last_block.hash(),
             proposer=proposer_node
         )
-        if new_block.transactions:
-             new_block.transactions[0]['predicted_consensus'] = 'PoW'
+
+        # Consensus information
+        new_block.transactions[0]['predicted_consensus'] = 'PoW'
+
         while True:
             new_block.nonce += 1
             hash_attempt = new_block.hash()
+
             if hash_attempt.startswith('0' * self.difficulty):
+
+                # Remove ONLY the transaction that was forged
                 self.pending_transactions.pop(0)
+
+                # Add the block
                 self.chain.append(new_block)
+
                 return new_block
+
             if new_block.nonce > 100000:
-                 new_block.nonce = 0
-                 new_block.timestamp = time.time()
+                new_block.nonce = 0
+                new_block.timestamp = time.time()
 
     def run_pos(self, proposer_node: str) -> Block:
         stakes = [self.nodes[name]['stake'] for name in self.nodes]
@@ -509,18 +530,28 @@ def save_network_state():
         print(f"❌ Error saving network state: {e}")
 
 def load_network_state():
-    """Loads and deserializes the network object's state or initializes default."""
     global network
-    network = Network() # Initialize a fresh network object first
-    
+
+    # ----------------------------------------
+    # CASE 1: Existing blockchain file exists
+    # ----------------------------------------
     if os.path.exists(NETWORK_STATE_FILE):
+
         try:
             with open(NETWORK_STATE_FILE, 'r') as f:
                 state = json.load(f)
-            
-            # Rebuild chain (must recreate Block objects from dicts)
+
+            # Create network object
+            network = Network()
+
+            # Remove the automatically created genesis block
             network.chain = []
+
+            # -------------------------------
+            # Restore blockchain
+            # -------------------------------
             for block_data in state.get('chain', []):
+
                 block = Block(
                     index=block_data['index'],
                     timestamp=block_data['timestamp'],
@@ -529,27 +560,83 @@ def load_network_state():
                     nonce=block_data.get('nonce', 0),
                     proposer=block_data.get('proposer')
                 )
+
                 network.chain.append(block)
 
-            # Restore simple properties
-            network.pending_transactions = state.get('pending_transactions', [])
-            network.nodes = state.get('nodes', network.nodes) # Keep Node-A if state is missing nodes
-            network.consensus_mode = state.get('consensus_mode', 'PoW')
-            network.difficulty = state.get('difficulty', 3)
-            network.active_users = state.get('active_users', {})
-            network.pending_users = state.get('pending_users', {})
-            
-            # Re-ensure genesis block if chain was empty or failed to load
-            if not network.chain:
-                 network.create_genesis_block()
+            # -------------------------------
+            # Restore pending transactions
+            # -------------------------------
+            network.pending_transactions = state.get(
+                'pending_transactions', []
+            )
 
-            # print("✅ Network state loaded from file.") # Disabled for cleaner console
-            
+            # -------------------------------
+            # Restore nodes
+            # -------------------------------
+            network.nodes = state.get(
+                'nodes', network.nodes
+            )
+
+            # -------------------------------
+            # Restore blockchain settings
+            # -------------------------------
+            network.consensus_mode = state.get(
+                'consensus_mode', 'PoW'
+            )
+
+            network.difficulty = state.get(
+                'difficulty', 3
+            )
+
+            network.consensus_algos = state.get(
+                'consensus_algos',
+                ['PoW', 'PoS', 'Raft', 'PBFT', 'HotStuff']
+            )
+
+            # -------------------------------
+            # Restore users
+            # -------------------------------
+            network.active_users = state.get(
+                'active_users', {}
+            )
+
+            network.pending_users = state.get(
+                'pending_users', {}
+            )
+
+            # If the saved chain was genuinely empty,
+            # create the genesis block
+            if len(network.chain) == 0:
+                network.create_genesis_block()
+
+            print(
+                f"✅ Blockchain loaded successfully. "
+                f"Blocks: {len(network.chain)}, "
+                f"Pending: {len(network.pending_transactions)}"
+            )
+
         except Exception as e:
-            print(f"❌ Error loading network state: {e}. Reinitializing network.")
-            network = Network() # Reset on failure
 
-    # Always ensure default users are set up
+            print("❌ Error loading blockchain:", e)
+
+            # IMPORTANT:
+            # Do not silently overwrite the old file.
+            # Only create a temporary fresh network in memory.
+            network = Network()
+
+    # ----------------------------------------
+    # CASE 2: No blockchain file exists
+    # ----------------------------------------
+    else:
+
+        print("ℹ️ No existing blockchain ledger found. Creating new blockchain.")
+
+        network = Network()
+
+        # Save the first genesis blockchain
+        save_network_state()
+
+    # Ensure required users exist
     ensure_default_users()
 
 def online_update(features_scaled, true_label_str):
