@@ -379,7 +379,20 @@ class Network:
         print("Risk Level:", risk_result["risk_level"])
         print("Recommendation:", risk_result["recommendation"])
         print("==================================\n")
+        print("\n========== AI EXPLANATION ==========")
 
+        print("\nRisk Factors:")
+        for reason in risk_result["explanation"]["risk_factors"]:
+            print("•", reason)
+
+        print("\nPositive Indicators:")
+        for reason in risk_result["explanation"]["positive_factors"]:
+            print("•", reason)
+
+        print("\nOverall:")
+        print(risk_result["explanation"]["overall"])
+
+        print("====================================\n")
         # Store risk result
         tx["risk_assessment"] = risk_result
 
@@ -580,12 +593,11 @@ class Network:
 # --- State Persistence Functions for Multi-User Support ---
 
 def save_network_state():
-    """Serializes and saves the network object's state to disk."""
+    """Safely saves the network state to disk using atomic replacement."""
 
     global network
 
     try:
-
         state = {
             'chain': [
                 block.to_dict()
@@ -614,16 +626,25 @@ def save_network_state():
                 network.pending_users,
         }
 
-        with open(
-            NETWORK_STATE_FILE,
-            'w'
-        ) as f:
+        # Write to temporary file FIRST
+        temp_file = NETWORK_STATE_FILE + ".tmp"
 
+        with open(temp_file, 'w', encoding='utf-8') as f:
             json.dump(
                 state,
                 f,
                 indent=4
             )
+
+            # Make sure everything is physically written
+            f.flush()
+            os.fsync(f.fileno())
+
+        # Replace old ledger ONLY after successful JSON writing
+        os.replace(
+            temp_file,
+            NETWORK_STATE_FILE
+        )
 
         print(
             f"💾 State saved | "
@@ -636,6 +657,15 @@ def save_network_state():
         print(
             f"❌ Error saving network state: {e}"
         )
+
+        # Remove failed temporary file if it exists
+        temp_file = NETWORK_STATE_FILE + ".tmp"
+
+        if os.path.exists(temp_file):
+            try:
+                os.remove(temp_file)
+            except:
+                pass
 
 def load_network_state():
 
@@ -763,7 +793,7 @@ def load_network_state():
             )
 
             # Do not save anything here
-            network = Network()
+            print("⚠️ Existing ledger was NOT overwritten.")
 
     # ----------------------------------------
     # No blockchain file

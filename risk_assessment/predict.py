@@ -251,6 +251,92 @@ def calculate_transaction_features(transaction, historical_transactions):
     print("===================================\n")
 
     return features
+
+# --------------------------------------------------
+# EXPLAIN AI DECISION
+# --------------------------------------------------
+
+def explain_risk(features, risk_score):
+
+    risk_factors = []
+    positive_factors = []
+
+    # Rapid transfer
+    if features["rapid_transfer_feature"] == 1:
+        risk_factors.append(
+            "Rapid transfer detected: the same land was transferred within 24 hours."
+        )
+
+    # Land transaction history
+    if features["land_transaction_count"] >= 2:
+        risk_factors.append(
+            f"Land has a history of {features['land_transaction_count']} previous transactions."
+        )
+
+    # Document duplication
+    if features["document_duplicate_count"] > 0:
+        risk_factors.append(
+            f"Document hash has appeared {features['document_duplicate_count']} time(s) before."
+        )
+    else:
+        positive_factors.append(
+            "No duplicate document detected."
+        )
+
+    # Seller activity
+    if features["seller_transaction_count"] >= 2:
+        risk_factors.append(
+            f"Seller has {features['seller_transaction_count']} previous transactions."
+        )
+    else:
+        positive_factors.append(
+            "Seller has limited previous transaction activity."
+        )
+
+    # Buyer activity
+    if features["buyer_transaction_count"] >= 2:
+        risk_factors.append(
+            f"Buyer has {features['buyer_transaction_count']} previous transactions."
+        )
+    else:
+        positive_factors.append(
+            "Buyer has limited previous transaction activity."
+        )
+
+    # Price deviation
+    if features["price_deviation"] >= 0.50:
+        risk_factors.append(
+            f"Land price differs significantly from the previous transaction "
+            f"({features['price_deviation'] * 100:.2f}% deviation)."
+        )
+    else:
+        positive_factors.append(
+            "No significant price deviation detected."
+        )
+
+    # Overall explanation
+    if risk_score >= 70:
+        overall = (
+            "The transaction shows multiple risk indicators "
+            "and requires careful human review."
+        )
+
+    elif risk_score >= 30:
+        overall = (
+            "The transaction shows some risk indicators "
+            "and should be reviewed manually."
+        )
+
+    else:
+        overall = (
+            "The transaction shows relatively few risk indicators."
+        )
+
+    return {
+        "risk_factors": risk_factors,
+        "positive_factors": positive_factors,
+        "overall": overall
+    }
 # --------------------------------------------------
 # ASSESS A NEW TRANSACTION
 # --------------------------------------------------
@@ -624,6 +710,10 @@ def assess_transaction(
         risk_level
     )
 
+    explanation = explain_risk(
+    features,
+    risk_score
+)
     # ----------------------------------------------
     # RETURN RESULT
     # ----------------------------------------------
@@ -645,7 +735,11 @@ def assess_transaction(
             recommendation,
 
         "features":
-            features
+            features,
+
+        "explanation":
+            explanation
+        
     }
 
 
@@ -713,3 +807,19 @@ if __name__ == "__main__":
         print(
             f"{key}: {value}"
         )
+    print("\n========== AI EXPLANATION ==========")
+
+    print("\nRisk Factors:")
+
+    for reason in result["explanation"]["risk_factors"]:
+        print("•", reason)
+
+    print("\nPositive Indicators:")
+
+    for reason in result["explanation"]["positive_factors"]:
+        print("•", reason)
+
+    print("\nOverall:")
+    print(result["explanation"]["overall"])
+
+    print("====================================")

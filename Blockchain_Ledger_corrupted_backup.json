@@ -1,0 +1,96 @@
+{
+    "chain": [
+        {
+            "index": 0,
+            "timestamp": 1789058939.9464383,
+            "transactions": [
+                {
+                    "message": "Genesis Block",
+                    "predicted_consensus": "PoW"
+                }
+            ],
+            "previous_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+            "nonce": 0,
+            "proposer": "Genesis"
+        },
+        {
+            "index": 1,
+            "timestamp": 1789059009.1150498,
+            "transactions": [
+                {
+                    "land_id": "568",
+                    "old_owner": "vishal",
+                    "new_owner": "UserB",
+                    "land_price": 500000,
+                    "document_hash": "0636d57f9a0ece2ededc6291b0d318068ce3469ecfa20980f98215d8e11069a9",
+                    "pqc_signature": "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",
+                    "pqc_public_key": "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",
+                    "timestamp": "2026-09-10T22:19:52.519759",
+                    "id": "f7a6907d-0ba0-4520-904a-9405a1a2d451",
+                    "risk_assessment": {
+                        "fraud_probability": 0.0221,
+                        "risk_score": 2.21,
+                        "risk_level": "LOW",
+                        "recommendation": "APPROVE",
+                        "features": {
+                            "land_price": 500000.0,
+                            "land_transaction_count": 0,
+                            "document_duplicate_count": 0,
+                            "seller_transaction_count": 0,
+                            "buyer_transaction_count": 0,
+                            "price_deviation": 0.0,
+                            "rapid_transfer_feature": 0
+                        },
+                        "explanation": {
+                            "risk_factors": [],
+                            "positive_factors": [
+                                "No duplicate document detected.",
+                                "Seller has limited previous transaction activity.",
+                                "Buyer has limited previous transaction activity.",
+                                "No significant price deviation detected."
+                            ],
+                            "overall": "The transaction shows relatively few risk indicators."
+                        }
+                    },
+                    "predicted_consensus": "PoW"
+                }
+            ],
+            "previous_hash": "e22410fd2d4c28793806028e1d8627d4b8cc1095b8fc80cb1edfe4705bf05abc",
+            "nonce": 4290,
+            "proposer": "Node-vishal"
+        }
+    ],
+    "pending_transactions": [],
+    "nodes": {
+        "Node-Sengathir": {
+            "stake": 200,
+            "address": "9a26a8c1-d2a5-42c7-9da8-e009867caa51",
+            "chain_length": 2
+        },
+        "Node-UserB": {
+            "stake": 300,
+            "address": "c53030c9-41fc-446c-88e2-662701980d82",
+            "chain_length": 2
+        },
+        "Node-vishal": {
+            "stake": 400,
+            "address": "1dfac5b4-83e4-40ea-b11b-e5bf95cb70f1",
+            "chain_length": 2
+        }
+    },
+    "consensus_mode": "PoW",
+    "difficulty": 3,
+    "consensus_algos": [
+        "PoW",
+        "PoS",
+        "Raft",
+        "PBFT",
+        "HotStuff"
+    ],
+    "active_users": {
+        "Sengathir": true,
+        "UserB": true,
+        "vishal": true
+    },
+    "pending_users": {}
+}
