@@ -1,6 +1,8 @@
 import torch
 import torch.nn.functional as F
 import pandas as pd
+import numpy as np
+import shap
 
 from risk_assessment.model import LandFraudGNN
 from risk_assessment.gnn_data import prepare_gnn_data
@@ -243,103 +245,184 @@ def calculate_transaction_features(transaction, historical_transactions):
         "rapid_transfer_feature": rapid_transfer_feature
     }
 
-    print("\n========== FEATURES USED ==========")
-
-    for key, value in features.items():
-        print(f"{key}: {value}")
-
-    print("===================================\n")
+    
 
     return features
 
+
 # --------------------------------------------------
-# EXPLAIN AI DECISION
+# SHAP EXPLANATION
 # --------------------------------------------------
 
-def explain_risk(features, risk_score):
+def calculate_shap_explanation(
+    model,
+    updated_x,
+    updated_edge_index,
+    transaction_index,
+    data,
+    current_features
+):
 
-    risk_factors = []
-    positive_factors = []
+    feature_names = [
+        "land_price",
+        "land_transaction_count",
+        "document_duplicate_count",
+        "seller_transaction_count",
+        "buyer_transaction_count",
+        "price_deviation",
+        "rapid_transfer_feature"
+    ]
 
-    # Rapid transfer
-    if features["rapid_transfer_feature"] == 1:
-        risk_factors.append(
-            "Rapid transfer detected: the same land was transferred within 24 hours."
+    # ----------------------------------------------
+    # CREATE BACKGROUND DATA FROM EXISTING
+    # TRANSACTION NODES
+    # ----------------------------------------------
+
+    transaction_nodes = data.x[data.transaction_mask]
+
+    background_scaled = transaction_nodes[
+        :, 3:9
+    ].numpy()
+
+    background_raw = data.scaler.inverse_transform(
+        background_scaled
+    )
+
+    rapid_transfer = transaction_nodes[
+        :, 9
+    ].numpy().reshape(-1, 1)
+
+    background = np.concatenate(
+        [
+            background_raw,
+            rapid_transfer
+        ],
+        axis=1
+    )
+
+    # Use a small background set for faster SHAP
+    background = background[:10]
+
+    # ----------------------------------------------
+    # PREDICTION FUNCTION FOR SHAP
+    # ----------------------------------------------
+
+    def shap_predict(X):
+
+        predictions = []
+
+        for row in X:
+
+            x_copy = updated_x.clone()
+
+            raw_features = np.array(
+                [
+                    0,
+                    0,
+                    1,
+                    row[0],
+                    row[1],
+                    row[2],
+                    row[3],
+                    row[4],
+                    row[5],
+                    row[6]
+                ],
+                dtype=float
+            ).reshape(1, -1)
+
+            # Apply the same scaling used by GNN
+            raw_features[
+                :,
+                data.numerical_columns
+            ] = data.scaler.transform(
+                raw_features[
+                    :,
+                    data.numerical_columns
+                ]
+            )
+
+            feature_tensor = torch.tensor(
+                raw_features,
+                dtype=torch.float
+            )
+
+            x_copy[
+                transaction_index
+            ] = feature_tensor[0]
+
+            with torch.no_grad():
+
+                output = model(
+                    x_copy,
+                    updated_edge_index
+                )
+
+                probability = F.softmax(
+                    output,
+                    dim=1
+                )[transaction_index][1]
+
+            predictions.append(
+                probability.item()
+            )
+
+        return np.array(predictions)
+
+    # ----------------------------------------------
+    # CREATE SHAP EXPLAINER
+    # ----------------------------------------------
+
+    explainer = shap.KernelExplainer(
+        shap_predict,
+        background
+    )
+
+    # ----------------------------------------------
+    # CALCULATE SHAP VALUES
+    # ----------------------------------------------
+
+    shap_values = explainer.shap_values(
+        np.array(
+            [[
+                current_features["land_price"],
+                current_features["land_transaction_count"],
+                current_features["document_duplicate_count"],
+                current_features["seller_transaction_count"],
+                current_features["buyer_transaction_count"],
+                current_features["price_deviation"],
+                current_features["rapid_transfer_feature"]
+            ]]
+        ),
+        nsamples=128
+    )
+
+    shap_values = np.array(shap_values)
+
+    if shap_values.ndim == 2:
+        shap_values = shap_values[0]
+
+    # ----------------------------------------------
+    # CREATE RESULT
+    # ----------------------------------------------
+
+    shap_explanation = {}
+
+    for name, value in zip(
+        feature_names,
+        shap_values
+    ):
+
+        shap_explanation[name] = round(
+            float(value),
+            6
         )
 
-    # Land transaction history
-    if features["land_transaction_count"] >= 2:
-        risk_factors.append(
-            f"Land has a history of {features['land_transaction_count']} previous transactions."
-        )
-
-    # Document duplication
-    if features["document_duplicate_count"] > 0:
-        risk_factors.append(
-            f"Document hash has appeared {features['document_duplicate_count']} time(s) before."
-        )
-    else:
-        positive_factors.append(
-            "No duplicate document detected."
-        )
-
-    # Seller activity
-    if features["seller_transaction_count"] >= 2:
-        risk_factors.append(
-            f"Seller has {features['seller_transaction_count']} previous transactions."
-        )
-    else:
-        positive_factors.append(
-            "Seller has limited previous transaction activity."
-        )
-
-    # Buyer activity
-    if features["buyer_transaction_count"] >= 2:
-        risk_factors.append(
-            f"Buyer has {features['buyer_transaction_count']} previous transactions."
-        )
-    else:
-        positive_factors.append(
-            "Buyer has limited previous transaction activity."
-        )
-
-    # Price deviation
-    if features["price_deviation"] >= 0.50:
-        risk_factors.append(
-            f"Land price differs significantly from the previous transaction "
-            f"({features['price_deviation'] * 100:.2f}% deviation)."
-        )
-    else:
-        positive_factors.append(
-            "No significant price deviation detected."
-        )
-
-    # Overall explanation
-    if risk_score >= 70:
-        overall = (
-            "The transaction shows multiple risk indicators "
-            "and requires careful human review."
-        )
-
-    elif risk_score >= 30:
-        overall = (
-            "The transaction shows some risk indicators "
-            "and should be reviewed manually."
-        )
-
-    else:
-        overall = (
-            "The transaction shows relatively few risk indicators."
-        )
-
-    return {
-        "risk_factors": risk_factors,
-        "positive_factors": positive_factors,
-        "overall": overall
-    }
+    return shap_explanation
 # --------------------------------------------------
 # ASSESS A NEW TRANSACTION
 # --------------------------------------------------
+
 
 def assess_transaction(
     transaction,
@@ -371,12 +454,7 @@ def assess_transaction(
         transaction,
         historical_transactions
     )
-    print("\n========== FEATURES USED ==========")
-
-    for key, value in features.items():
-        print(f"{key}: {value}")
-
-    print("===================================\n")
+    
 
     # ----------------------------------------------
     # GET CURRENT GRAPH FEATURES AND EDGES
@@ -710,9 +788,14 @@ def assess_transaction(
         risk_level
     )
 
-    explanation = explain_risk(
-    features,
-    risk_score
+    
+    shap_explanation = calculate_shap_explanation(
+    model,
+    updated_x,
+    updated_edge_index,
+    transaction_index,
+    data,
+    features
 )
     # ----------------------------------------------
     # RETURN RESULT
@@ -737,9 +820,9 @@ def assess_transaction(
         "features":
             features,
 
-        "explanation":
-            explanation
-        
+
+        "shap_explanation":
+            shap_explanation
     }
 
 
@@ -749,27 +832,28 @@ def assess_transaction(
 
 if __name__ == "__main__":
 
+    dataset_path = "Dataset/land_transactions.csv"
+
+    df = pd.read_csv(dataset_path)
+
+    # Convert dataset rows into transaction dictionaries
+    historical_transactions = df.to_dict("records")
+
+    print(f"\nHistorical transactions available: {len(historical_transactions)}")
+
+
     test_transaction = {
-
-        "land_id": 987,
-
-        "old_owner": "Sengadir",
-
-        "new_owner": "Sri",
-
-        "land_price": 5000000,
-
-        "document_hash":
-            "test_new_document_hash_987",
-
-        "timestamp":
-            "2026-08-27T20:00:00"
-
-    }
+    "land_id": "1844",
+    "old_owner": "User_469",
+    "new_owner": "User_999",
+    "land_price": 20000000,
+    "document_hash": "e9453c54eacf126ddaf57c571c000c8daf04ce251980dbcb16a2aaa8d2a451ac",
+    "timestamp": "2026-10-02T05:10:00"
+}
 
     result = assess_transaction(
         test_transaction,
-        []
+        historical_transactions
     )
 
     print(
@@ -807,19 +891,10 @@ if __name__ == "__main__":
         print(
             f"{key}: {value}"
         )
-    print("\n========== AI EXPLANATION ==========")
+    print("\n========== SHAP EXPLANATION ==========")
 
-    print("\nRisk Factors:")
+    for feature, shap_value in result["shap_explanation"].items():
+        print(f"{feature}: {shap_value:+.6f}")
 
-    for reason in result["explanation"]["risk_factors"]:
-        print("•", reason)
-
-    print("\nPositive Indicators:")
-
-    for reason in result["explanation"]["positive_factors"]:
-        print("•", reason)
-
-    print("\nOverall:")
-    print(result["explanation"]["overall"])
-
-    print("====================================")
+    print("======================================")
+        

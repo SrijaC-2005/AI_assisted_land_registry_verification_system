@@ -218,6 +218,7 @@ class Network:
     def __init__(self):
         self.chain: List[Block] = []
         self.pending_transactions: List[Dict] = []
+        self.blocked_transactions: List[Dict] = []
         self.nodes: Dict[str, Dict] = {}
         self.consensus_mode: str = 'PoW'
         self.difficulty: int = 3
@@ -379,25 +380,47 @@ class Network:
         print("Risk Level:", risk_result["risk_level"])
         print("Recommendation:", risk_result["recommendation"])
         print("==================================\n")
-        print("\n========== AI EXPLANATION ==========")
+        print("\n========== SHAP EXPLANATION ==========")
 
-        print("\nRisk Factors:")
-        for reason in risk_result["explanation"]["risk_factors"]:
-            print("•", reason)
+        for feature, shap_value in risk_result["shap_explanation"].items():
+            print(f"{feature}: {shap_value:+.6f}")
 
-        print("\nPositive Indicators:")
-        for reason in risk_result["explanation"]["positive_factors"]:
-            print("•", reason)
-
-        print("\nOverall:")
-        print(risk_result["explanation"]["overall"])
-
-        print("====================================\n")
+        print("======================================\n")
         # Store risk result
         tx["risk_assessment"] = risk_result
 
         # ------------------------------------------
-        # ADD TO PENDING QUEUE
+        # HIGH-RISK TRANSACTION
+        # ------------------------------------------
+
+        if risk_result["risk_level"] == "HIGH":
+
+            blocked_tx = {
+                "transaction": tx,
+                "risk_assessment": risk_result,
+                "blocked_at": datetime.now().isoformat(),
+                "reason": "AI detected HIGH risk"
+            }
+
+            self.blocked_transactions.append(blocked_tx)
+
+            print("HIGH-RISK TRANSACTION BLOCKED.")
+            print("Transaction was NOT added to pending queue.")
+            print(
+                "Current blocked transactions:",
+                len(self.blocked_transactions)
+            )
+
+            return False, {
+                "blocked": True,
+                "transaction": tx,
+                "risk_assessment": risk_result,
+                "message": "Transaction blocked because AI detected HIGH risk."
+            }
+
+
+        # ------------------------------------------
+        # LOW / MEDIUM → EXISTING PENDING QUEUE
         # ------------------------------------------
 
         self.pending_transactions.append(tx)
@@ -607,6 +630,9 @@ def save_network_state():
             'pending_transactions':
                 network.pending_transactions,
 
+            'blocked_transactions':
+                network.blocked_transactions,
+
             'nodes':
                 network.nodes,
 
@@ -725,7 +751,10 @@ def load_network_state():
                 'pending_transactions',
                 []
             )
-
+            network.blocked_transactions = state.get(
+                'blocked_transactions',
+                []
+            )
             # --------------------------------
             # Restore nodes
             # --------------------------------
@@ -1049,6 +1078,7 @@ def get_state():
     return jsonify({
         'chain': [block.to_dict() for block in network.chain],
         'pending_transactions': network.pending_transactions,
+        'blocked_transactions': network.blocked_transactions,
         'nodes': network.nodes,
         'consensus_mode': network.consensus_mode,
         'predicted_mode': prediction,       # <--- ADD THIS
@@ -1151,12 +1181,12 @@ def remove_node():
     return jsonify({'success': success, 'message': f"Node {name} removed."})
 
 @app.route('/api/add_land_tx', methods=['POST'])
-@persist_action
+
 def add_land_tx():
     current_user = session.get('username', 'Anonymous')
     
     # Check if user is active (approved by community)
-    load_network_state()
+    
     if current_user not in network.active_users:
         return jsonify({'success': False, 'message': f'User "{current_user}" is not yet approved by the community. Please wait for approval.'}), 403
     
@@ -1180,9 +1210,35 @@ def add_land_tx():
     )
 
     if not success:
-        return jsonify({'success': False, 'message': result})
+
+        # HIGH-risk transaction was blocked by AI
+        if isinstance(result, dict) and result.get("blocked"):
+
+            print("Saving HIGH-risk blocked transaction...")
+            save_network_state()
+
+            return jsonify({
+                'success': False,
+                'blocked': True,
+                'message': result["message"],
+                'transaction': result["transaction"],
+                'risk_assessment': result["risk_assessment"]
+            })
+
+        # Other failures such as duplicate transaction
+        return jsonify({
+            'success': False,
+            'message': result
+        })
+
+
     print("Saving transaction to blockchain state...")
     save_network_state()
+
+    print(
+        "Saved pending transactions:",
+        len(network.pending_transactions)
+    )
 
     print(
         "Saved pending transactions:",
@@ -1441,6 +1497,239 @@ INDEX_HTML = """
             background: #f59e0b;
             color: white;
         }
+        /* ================= AI RISK EXPLANATION ================= */
+
+        .risk-modal-overlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(15, 23, 42, 0.65);
+            backdrop-filter: blur(4px);
+            z-index: 9999;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+
+        .risk-modal {
+            background: white;
+            width: min(900px, 95vw);
+            max-height: 90vh;
+            overflow-y: auto;
+            border-radius: 20px;
+            box-shadow: 0 25px 60px rgba(0,0,0,0.25);
+        }
+
+        .risk-modal-header {
+            padding: 22px 26px;
+            border-bottom: 1px solid #e2e8f0;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .risk-modal-title {
+            font-size: 18px;
+            font-weight: 800;
+            color: #0f172a;
+        }
+
+        .risk-close {
+            width: 34px;
+            height: 34px;
+            border: none;
+            border-radius: 50%;
+            background: #f1f5f9;
+            color: #475569;
+            font-size: 20px;
+            cursor: pointer;
+        }
+
+        .risk-close:hover {
+            background: #e2e8f0;
+        }
+
+        .risk-modal-body {
+            padding: 24px 26px;
+        }
+
+        .risk-summary {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 14px;
+            margin-bottom: 24px;
+        }
+
+        .risk-summary-card {
+            padding: 16px;
+            border-radius: 14px;
+            background: #f8fafc;
+            border: 1px solid #e2e8f0;
+        }
+
+        .risk-summary-label {
+            font-size: 10px;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            font-weight: 700;
+            color: #64748b;
+            margin-bottom: 6px;
+        }
+
+        .risk-summary-value {
+            font-size: 18px;
+            font-weight: 800;
+            color: #0f172a;
+        }
+
+        .risk-section {
+            margin-top: 24px;
+        }
+
+        .risk-section-title {
+            font-size: 13px;
+            font-weight: 800;
+            color: #334155;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            margin-bottom: 12px;
+        }
+
+        .feature-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 10px;
+        }
+
+        .feature-item {
+            background: #f8fafc;
+            border: 1px solid #e2e8f0;
+            border-radius: 12px;
+            padding: 12px 14px;
+        }
+
+        .feature-name {
+            font-size: 11px;
+            color: #64748b;
+            margin-bottom: 4px;
+        }
+
+        .feature-value {
+            font-size: 14px;
+            font-weight: 700;
+            color: #0f172a;
+        }
+
+        .shap-list {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .shap-item {
+            display: grid;
+            grid-template-columns: 190px 90px 1fr;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .shap-name {
+            font-size: 11px;
+            font-weight: 600;
+            color: #334155;
+        }
+
+        .shap-value {
+            font-family: monospace;
+            font-size: 11px;
+            font-weight: 700;
+        }
+
+        .shap-bar-container {
+            height: 9px;
+            background: #e2e8f0;
+            border-radius: 10px;
+            overflow: hidden;
+        }
+
+        .shap-bar {
+            height: 100%;
+            border-radius: 10px;
+        }
+
+        .shap-positive {
+            background: #ef4444;
+        }
+
+        .shap-negative {
+            background: #22c55e;
+        }
+
+        .ai-interpretation {
+            background: #f8fafc;
+            border-left: 4px solid #6366f1;
+            border-radius: 10px;
+            padding: 15px 17px;
+            font-size: 13px;
+            line-height: 1.6;
+            color: #475569;
+        }
+
+        .ai-warning {
+            margin-top: 14px;
+            padding: 12px 15px;
+            background: #fff7ed;
+            border: 1px solid #fed7aa;
+            border-radius: 10px;
+            font-size: 12px;
+            color: #9a3412;
+        }
+
+        .view-risk-btn {
+            margin-top: 12px;
+            width: 100%;
+            padding: 9px 12px;
+            border: none;
+            border-radius: 9px;
+            background: #4f46e5;
+            color: white;
+            font-size: 11px;
+            font-weight: 700;
+            cursor: pointer;
+            transition: 0.2s;
+        }
+
+        .view-risk-btn:hover {
+            background: #4338ca;
+            transform: translateY(-1px);
+        }
+
+        .risk-low {
+            color: #16a34a;
+        }
+
+        .risk-medium {
+            color: #d97706;
+        }
+
+        .risk-high {
+            color: #dc2626;
+        }
+
+        @media (max-width: 640px) {
+            .risk-summary {
+                grid-template-columns: 1fr;
+            }
+
+            .feature-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .shap-item {
+                grid-template-columns: 1fr;
+                gap: 5px;
+            }
+        }
     </style>
 </head>
 <body class="p-4 sm:p-8">
@@ -1577,12 +1866,26 @@ INDEX_HTML = """
 
     <div class="card p-6 mb-8">
         <h2 class="text-sm font-bold mb-4 text-slate-800 flex items-center gap-2">
-            <span class="w-2 h-5 bg-blue-600 rounded-full"></span>
-            Live Transaction Queue
-        </h2>
+    <span class="w-2 h-5 bg-blue-600 rounded-full"></span>
+    Live Transaction Queue
+</h2>
 
-        <div id="pending-tx-view" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-            </div>
+<div id="pending-tx-view" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+</div>
+
+<!-- AI BLOCKED TRANSACTIONS -->
+<div class="mt-8">
+
+    <h2 class="text-sm font-bold mb-4 text-slate-800 flex items-center gap-2">
+        <span class="w-2 h-5 bg-red-600 rounded-full"></span>
+        AI Blocked Transactions
+    </h2>
+
+    <div id="blocked-tx-view"
+         class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+    </div>
+
+</div>
     </div>
 
 <script>
@@ -1757,26 +2060,603 @@ function renderChain(chain, difficulty) {
 function renderPendingTx(txList) {
     const pendingTxViewEl = document.getElementById('pending-tx-view');
     pendingTxViewEl.innerHTML = '';
-    
+
     if (txList.length === 0) {
-        pendingTxViewEl.innerHTML = '<div class="col-span-full py-8 text-center text-slate-400 text-sm italic text-sm">No transactions currently in queue...</div>';
+        pendingTxViewEl.innerHTML =
+            '<div class="col-span-full py-8 text-center text-slate-400 text-sm italic">No transactions currently in queue...</div>';
         return;
     }
 
-    txList.forEach(tx => {
+    txList.forEach((tx, index) => {
+
+        const risk = tx.risk_assessment || {};
+
+        const riskLevel = risk.risk_level || "UNKNOWN";
+        const riskScore = risk.risk_score ?? 0;
+        const recommendation = risk.recommendation || "N/A";
+
+        let riskClass = "risk-medium";
+
+        if (riskLevel === "LOW") {
+            riskClass = "risk-low";
+        } else if (riskLevel === "HIGH") {
+            riskClass = "risk-high";
+        }
+
         pendingTxViewEl.innerHTML += `
             <div class="p-4 rounded-lg bg-white border border-slate-200 shadow-sm">
-                <div class="flex justify-between items-start mb-2">
-                    <span class="text-blue-600 font-mono text-[10px]">TX_${formatHash(tx.id)}</span>
-                    <span class="text-slate-800 font-bold text-xs"">₹${tx.land_price.toLocaleString("en-IN")}</span>
+
+                <div class="flex justify-between items-start mb-3">
+
+                    <div>
+                        <span class="text-blue-600 font-mono text-[10px]">
+                            TX_${formatHash(tx.id)}
+                        </span>
+
+                        <p class="text-sm font-bold text-slate-800 mt-1">
+                            Land ID: ${tx.land_id}
+                        </p>
+                    </div>
+
+                    <span class="text-slate-800 font-bold text-sm">
+                        ₹${Number(tx.land_price).toLocaleString("en-IN")}
+                    </span>
+
                 </div>
-                <div class="text-[11px] space-y-1">
-                    <p><span class="text-slate-500">FROM:</span> ${tx.old_owner}</p>
-                    <p><span class="text-slate-500">TO:</span> ${tx.new_owner}</p>
+
+                <div class="text-[11px] space-y-1 mb-3">
+                    <p>
+                        <span class="text-slate-500">FROM:</span>
+                        ${tx.old_owner}
+                    </p>
+
+                    <p>
+                        <span class="text-slate-500">TO:</span>
+                        ${tx.new_owner}
+                    </p>
                 </div>
+
+                <div class="flex justify-between items-center 
+                            bg-slate-50 rounded-lg px-3 py-2">
+
+                    <div>
+                        <p class="text-[9px] text-slate-500 uppercase font-bold">
+                            AI Risk
+                        </p>
+
+                        <p class="text-sm font-extrabold ${riskClass}">
+                            ${riskLevel}
+                        </p>
+                    </div>
+
+                    <div class="text-right">
+                        <p class="text-[9px] text-slate-500 uppercase font-bold">
+                            Score
+                        </p>
+
+                        <p class="text-sm font-extrabold ${riskClass}">
+                            ${Number(riskScore).toFixed(2)} / 100
+                        </p>
+                    </div>
+
+                </div>
+
+                <button
+                    class="view-risk-btn"
+                    onclick="showRiskExplanation(${index})">
+
+                    🔍 View AI Explanation
+
+                </button>
+
             </div>
         `;
     });
+
+    window.currentPendingTransactions = txList;
+}
+function renderBlockedTx(txList) {
+
+    const container = document.getElementById('blocked-tx-view');
+
+    if (!container) return;
+
+    container.innerHTML = '';
+
+    if (!txList || txList.length === 0) {
+        container.innerHTML =
+            '<div class="col-span-full py-8 text-center text-slate-400 text-sm italic">No AI-blocked transactions...</div>';
+
+        return;
+    }
+
+    window.currentBlockedTransactions = txList;
+
+    txList.forEach((item, index) => {
+
+        const tx = item.transaction || {};
+        const risk = item.risk_assessment || {};
+
+        container.innerHTML += `
+            <div class="p-4 rounded-lg bg-white border border-red-200 shadow-sm">
+
+                <div class="flex justify-between items-start mb-3">
+
+                    <div>
+                        <span class="text-red-600 font-mono text-[10px]">
+                            AI BLOCKED
+                        </span>
+
+                        <p class="text-sm font-bold text-slate-800 mt-1">
+                            Land ID: ${tx.land_id || "N/A"}
+                        </p>
+                    </div>
+
+                    <span class="text-slate-800 font-bold text-sm">
+                        ₹${Number(tx.land_price || 0).toLocaleString("en-IN")}
+                    </span>
+
+                </div>
+
+                <div class="text-[11px] space-y-1 mb-3">
+
+                    <p>
+                        <span class="text-slate-500">FROM:</span>
+                        ${tx.old_owner || "N/A"}
+                    </p>
+
+                    <p>
+                        <span class="text-slate-500">TO:</span>
+                        ${tx.new_owner || "N/A"}
+                    </p>
+
+                </div>
+
+                <div class="flex justify-between items-center bg-red-50 rounded-lg px-3 py-2">
+
+                    <div>
+                        <p class="text-[9px] text-slate-500 uppercase font-bold">
+                            AI Risk
+                        </p>
+
+                        <p class="text-sm font-extrabold risk-high">
+                            HIGH
+                        </p>
+                    </div>
+
+                    <div class="text-right">
+
+                        <p class="text-[9px] text-slate-500 uppercase font-bold">
+                            Score
+                        </p>
+
+                        <p class="text-sm font-extrabold risk-high">
+                            ${Number(risk.risk_score || 0).toFixed(2)} / 100
+                        </p>
+
+                    </div>
+
+                </div>
+
+                <div class="mt-3 p-3 bg-red-50 rounded-lg">
+
+                    <p class="text-[11px] text-red-700">
+                        ❌ This transaction was blocked because the AI detected HIGH risk.
+                    </p>
+
+                </div>
+
+                <button
+                    class="view-risk-btn"
+                    onclick="showRiskExplanation(${index},'blocked')">
+
+                    🔍 View AI Explanation
+
+                </button>
+
+            </div>
+        `;
+    });
+}
+
+
+
+function showRiskExplanation(index,type="pending") {
+
+    let tx;
+    let risk;
+
+    if (type === "blocked") {
+
+        const blockedItem =
+            window.currentBlockedTransactions[index];
+
+        if (!blockedItem) {
+            alert("Blocked transaction is not available.");
+            return;
+        }
+
+        tx = blockedItem.transaction || {};
+        risk = blockedItem.risk_assessment || {};
+
+    } else {
+
+        tx = window.currentPendingTransactions[index];
+
+        if (!tx || !tx.risk_assessment) {
+            alert("AI risk assessment is not available for this transaction.");
+            return;
+        }
+
+        risk = tx.risk_assessment;
+    }
+
+    const features = risk.features || {};
+    const shap = risk.shap_explanation || {};
+
+
+    const riskLevel = risk.risk_level || "UNKNOWN";
+    const recommendation = risk.recommendation || "N/A";
+    const riskScore = Number(risk.risk_score || 0);
+    const fraudProbability = Number(risk.fraud_probability || 0);
+
+    let riskClass = "risk-medium";
+
+    if (riskLevel === "LOW") {
+        riskClass = "risk-low";
+    } else if (riskLevel === "HIGH") {
+        riskClass = "risk-high";
+    }
+
+    const featureLabels = {
+        land_price: "Land Price",
+        land_transaction_count: "Previous Land Transactions",
+        document_duplicate_count: "Document Duplicates",
+        seller_transaction_count: "Seller Transactions",
+        buyer_transaction_count: "Buyer Transactions",
+        price_deviation: "Price Deviation",
+        rapid_transfer_feature: "Rapid Transfer"
+    };
+
+    function formatFeatureValue(name, value) {
+
+        if (name === "land_price") {
+            return "₹" + Number(value).toLocaleString("en-IN");
+        }
+
+        if (name === "price_deviation") {
+            return Number(value).toFixed(2) + "×";
+        }
+
+        if (name === "rapid_transfer_feature") {
+            return Number(value) === 1
+                ? "Detected"
+                : "Not Detected";
+        }
+
+        return Number(value).toLocaleString("en-IN");
+    }
+
+    let featureHTML = "";
+
+    Object.keys(featureLabels).forEach(name => {
+
+        if (features[name] === undefined) return;
+
+        featureHTML += `
+            <div class="feature-item">
+
+                <div class="feature-name">
+                    ${featureLabels[name]}
+                </div>
+
+                <div class="feature-value">
+                    ${formatFeatureValue(name, features[name])}
+                </div>
+
+            </div>
+        `;
+    });
+
+
+    // ---------------- SHAP ----------------
+
+    const shapEntries = Object.entries(shap);
+
+    let maxAbsShap = 0;
+
+    shapEntries.forEach(([name, value]) => {
+        maxAbsShap = Math.max(
+            maxAbsShap,
+            Math.abs(Number(value))
+        );
+    });
+
+    if (maxAbsShap === 0) {
+        maxAbsShap = 1;
+    }
+
+    let shapHTML = "";
+
+    shapEntries.forEach(([name, value]) => {
+
+        const shapValue = Number(value);
+
+        const percentage =
+            Math.min(
+                100,
+                (Math.abs(shapValue) / maxAbsShap) * 100
+            );
+
+        const impactClass =
+            shapValue >= 0
+                ? "shap-positive"
+                : "shap-negative";
+
+        const impactText =
+            shapValue >= 0
+                ? "↑ Risk"
+                : "↓ Risk";
+
+        shapHTML += `
+            <div class="shap-item">
+
+                <div class="shap-name">
+                    ${featureLabels[name] || name}
+                </div>
+
+                <div class="shap-value ${shapValue >= 0 ? 'risk-high' : 'risk-low'}">
+                    ${shapValue >= 0 ? '+' : ''}
+                    ${shapValue.toFixed(6)}
+                    <span style="font-family:inherit; font-size:9px;">
+                        ${impactText}
+                    </span>
+                </div>
+
+                <div class="shap-bar-container">
+
+                    <div
+                        class="shap-bar ${impactClass}"
+                        style="width:${percentage}%">
+                    </div>
+
+                </div>
+
+            </div>
+        `;
+    });
+
+
+    // ---------------- INTERPRETATION ----------------
+
+    const positiveFactors = shapEntries
+        .filter(([name, value]) => Number(value) > 0)
+        .sort((a, b) => Number(b[1]) - Number(a[1]));
+
+    let interpretation =
+        "The AI model evaluated the transaction using the available land transaction features.";
+
+    if (positiveFactors.length > 0) {
+
+        const strongest = positiveFactors[0][0];
+
+        const explanations = {
+
+            land_price:
+                "The land price contributed to the model's risk assessment.",
+
+            land_transaction_count:
+                "The number of previous transactions involving this land contributed to the risk assessment.",
+
+            document_duplicate_count:
+                "Repeated document information contributed to the risk assessment.",
+
+            seller_transaction_count:
+                "The seller's transaction history contributed to the risk assessment.",
+
+            buyer_transaction_count:
+                "The buyer's transaction history contributed to the risk assessment.",
+
+            price_deviation:
+                "The difference between the current price and the previous land transaction price was a major contributor to the risk assessment.",
+
+            rapid_transfer_feature:
+                "The short time interval between land transfers contributed to the risk assessment."
+        };
+
+        interpretation =
+            explanations[strongest] ||
+            interpretation;
+    }
+
+    // ---------------- MODAL ----------------
+
+    const modal = document.createElement("div");
+
+    modal.className = "risk-modal-overlay";
+
+    modal.innerHTML = `
+
+        <div class="risk-modal">
+
+            <!-- HEADER -->
+
+            <div class="risk-modal-header">
+
+                <div>
+
+                    <div class="risk-modal-title">
+                        🤖 AI Risk Explanation
+                    </div>
+
+                    <div class="text-[11px] text-slate-500 mt-1">
+                        Land ID: ${tx.land_id}
+                        &nbsp; • &nbsp;
+                        TX_${formatHash(tx.id)}
+                    </div>
+
+                </div>
+
+                <button
+                    class="risk-close"
+                    onclick="this.closest('.risk-modal-overlay').remove()">
+
+                    ×
+
+                </button>
+
+            </div>
+
+
+            <!-- BODY -->
+
+            <div class="risk-modal-body">
+
+
+                <!-- SUMMARY -->
+
+                <div class="risk-summary">
+
+                    <div class="risk-summary-card">
+
+                        <div class="risk-summary-label">
+                            Risk Level
+                        </div>
+
+                        <div class="risk-summary-value ${riskClass}">
+                            ${riskLevel}
+                        </div>
+
+                    </div>
+
+
+                    <div class="risk-summary-card">
+
+                        <div class="risk-summary-label">
+                            Risk Score
+                        </div>
+
+                        <div class="risk-summary-value ${riskClass}">
+                            ${riskScore.toFixed(2)} / 100
+                        </div>
+
+                    </div>
+
+
+                    <div class="risk-summary-card">
+
+                        <div class="risk-summary-label">
+                            Fraud Probability
+                        </div>
+
+                        <div class="risk-summary-value ${riskClass}">
+                            ${(fraudProbability * 100).toFixed(2)}%
+                        </div>
+
+                    </div>
+
+                </div>
+
+
+                <!-- RECOMMENDATION -->
+
+                <div class="risk-summary-card mb-5">
+
+                    <div class="risk-summary-label">
+                        AI Recommendation
+                    </div>
+
+                    <div class="risk-summary-value ${riskClass}">
+                        ${recommendation}
+                    </div>
+
+                </div>
+
+
+                <!-- FEATURES -->
+
+                <div class="risk-section">
+
+                    <div class="risk-section-title">
+                         Features Used by GNN
+                    </div>
+
+                    <div class="feature-grid">
+
+                        ${featureHTML}
+
+                    </div>
+
+                </div>
+
+
+                <!-- SHAP -->
+
+                <div class="risk-section">
+
+                    <div class="risk-section-title">
+                        🔍 SHAP Explanation
+                    </div>
+
+                    <div class="shap-list">
+
+                        ${shapHTML}
+
+                    </div>
+
+                    <div class="text-[10px] text-slate-400 mt-3">
+                        Positive SHAP values increase the model's
+                        fraud-risk prediction. Negative SHAP values
+                        decrease it.
+                    </div>
+
+                </div>
+
+
+                <!-- INTERPRETATION -->
+
+                <div class="risk-section">
+
+                    <div class="risk-section-title">
+                        💡 AI Interpretation
+                    </div>
+
+                    <div class="ai-interpretation">
+
+                        ${interpretation}
+
+                    </div>
+
+                    <div class="ai-warning">
+
+                        ⚠️ <strong>Human Review Required:</strong>
+                        The AI recommendation is advisory.
+                        The final transaction decision should be
+                        made by the authorized user.
+
+                    </div>
+
+                </div>
+
+
+            </div>
+
+        </div>
+    `;
+
+    document.body.appendChild(modal);
+
+
+    // Close when clicking outside modal
+
+    modal.addEventListener("click", function(event) {
+
+        if (event.target === modal) {
+            modal.remove();
+        }
+
+    });
+
 }
 
 function renderGovernance(users) {
@@ -1834,6 +2714,7 @@ async function refresh() {
 
         renderChain(currentState.chain, currentState.difficulty);
         renderPendingTx(currentState.pending_transactions);
+        renderBlockedTx(currentState.blocked_transactions || []);
         renderGovernance(currentUsers);
     } catch (e) { console.error("Refresh failed", e); }
 }
@@ -1939,4 +2820,4 @@ if __name__ == '__main__':
     print("\n--- ConcordiaChain Simulator ---")
     print(f"Credentials loaded from: {CREDENTIALS_FILE}")
     print(f"Total Users: {len(USERS)}")
-    app.run(debug=True, use_reloader=False)
+    app.run(debug=True, use_reloader=False, threaded=False)
