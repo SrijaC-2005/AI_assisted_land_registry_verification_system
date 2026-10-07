@@ -34,6 +34,16 @@ NETWORK_STATE_FILE = os.path.join(BASE_DIR, "Blockchain_Ledger.json") # New file
 USERS: Dict[str, str] = {} # {username: hashed_password}
 MAX_NODES = 5
 
+# Software-only network metric configuration.
+# These are deterministic calculations from this Flask process; no random
+# values and no external hardware are used. The power value is an explicit
+# software energy-model assumption, not a physical measurement.
+SOFTWARE_CPU_POWER_WATTS = 50.0
+THROUGHPUT_WINDOW_SECONDS = 60.0
+METRIC_LATENCY_PAYLOAD = b'LAND_REGISTRY_NODE_PING'
+METRICS_PROCESS_START = time.process_time()
+METRICS_WALL_START = time.perf_counter()
+
 
 # --- Credential Management Functions (Unchanged) ---
 def load_users_from_csv():
@@ -84,50 +94,77 @@ def save_users_to_csv():
     except Exception as e:
         print(f"❌ Error saving credentials: {e}")
 
-# --- ML Model and Data Setup (Unchanged in logic) ---
+# --- ML Model Setup ---
+# The CSV is used for training/validation only. Runtime prediction NEVER samples
+# a random row from the CSV.
 try:
     import pandas as pd
     import numpy as np
     import joblib
-    
+
     model_ready = False
     model = None
     label_encoder = None
-    df_traffic = None
     scaler = None
+    df_traffic = None
 
     ML_EXPECTED_FEATURES = [
-        'node_count', 
-        'network_latency_ms', 
-        'tx_throughput_tps', 
-        'energy_joules_per_min', 
-        'security_risk_score', 
-        'vehicle_count', 
-        'vehicle_count_variability', 
+        'node_count',
+        'network_latency_ms',
+        'tx_throughput_tps',
+        'energy_joules_per_min',
+        'security_risk_score',
+        'vehicle_count',
+        'vehicle_count_variability',
         'fault_tolerance_requirement'
     ]
-    MODEL_FEATURES = []
 
-    if os.path.exists(MODEL_PATH) and os.path.exists(LABEL_ENCODER_PATH) and os.path.exists(DATA_PATH) and os.path.exists(SCALER_PATH):
+    MODEL_FEATURES = ML_EXPECTED_FEATURES.copy()
+
+    # The model, encoder and scaler are the runtime assets.
+    # The dataset is NOT required for runtime prediction.
+    if (
+        os.path.exists(MODEL_PATH)
+        and os.path.exists(LABEL_ENCODER_PATH)
+        and os.path.exists(SCALER_PATH)
+    ):
         try:
             model = joblib.load(MODEL_PATH)
             label_encoder = joblib.load(LABEL_ENCODER_PATH)
             scaler = joblib.load(SCALER_PATH)
 
-            df_traffic = pd.read_csv(DATA_PATH)
-            MODEL_FEATURES = ML_EXPECTED_FEATURES
+            if os.path.exists(DATA_PATH):
+                try:
+                    df_traffic = pd.read_csv(DATA_PATH)
+                    missing = [
+                        f for f in ML_EXPECTED_FEATURES
+                        if f not in df_traffic.columns
+                    ]
+                    if missing:
+                        print(
+                            "⚠️ Training dataset is missing features:",
+                            missing
+                        )
+                    else:
+                        print(
+                            "📊 Training dataset loaded for reference only."
+                        )
+                except Exception as e:
+                    print(f"⚠️ Could not read training dataset: {e}")
 
-            if not all(feature in df_traffic.columns for feature in ML_EXPECTED_FEATURES):
-                print("❌ Missing ML features.")
-            else:
-                model_ready = True
-                print("🧠 Federated SGD model loaded. Dynamic consensus active.")
+            model_ready = True
+            print(
+                "🧠 Federated SGD model, scaler and label encoder loaded. "
+                "Runtime prediction uses current network metrics only."
+            )
 
         except Exception as e:
             print(f"⚠️ Failed to load ML assets: {e}")
-
     else:
-        print("⚠️ ML files not found. Running in static consensus mode.")
+        print(
+            "⚠️ ML model/scaler/encoder files not found. "
+            "Running in static consensus mode."
+        )
 
 except Exception as e:
     print(f"⚠️ ML library imports failed. Error: {e}")
@@ -223,6 +260,11 @@ class Network:
         self.consensus_mode: str = 'PoW'
         self.difficulty: int = 3
         self.consensus_algos: List[str] = ['PoW', 'PoS', 'Raft', 'PBFT', 'HotStuff']
+        # Runtime network metrics are calculated from the software simulation.
+        # No random dataset row is used for runtime inference.
+        self.network_metrics: Dict[str, Any] = {}
+        self.last_consensus_prediction: str = 'PoW'
+        self.last_consensus_prediction_metrics: Dict[str, Any] = {}
         self.active_users: Dict[str, bool] = {} # {username: True}
         self.pending_users: Dict[str, List[str]] = {} # {username: [voter1, voter2, ...]}
         self.add_node('Node-A', is_initial=True)
@@ -437,6 +479,268 @@ class Network:
 
         return True, tx
 
+    def _recent_transactions(self, window_seconds=THROUGHPUT_WINDOW_SECONDS):
+        """Return blockchain transactions committed within the measurement window."""
+        now = time.time()
+        recent = []
+        for block in self.chain:
+            if block.index == 0:
+                continue
+            if now - float(block.timestamp) <= window_seconds:
+                for tx in block.transactions:
+                    if isinstance(tx, dict) and "land_id" in tx:
+                        recent.append((block, tx))
+        return recent
+
+    def _software_node_latency_ms(self):
+        """
+        Measure application-level node communication work inside this Flask
+        process. Each configured node receives the same ping payload, performs
+        serialization/hash work, and is looked up in the node table.
+
+        This is a software-emulated network latency metric, not physical
+        network RTT, because all simulated nodes live in one Python process.
+        """
+        if not self.nodes:
+            return 0.0
+
+        timings = []
+        for node_name in self.nodes:
+            start = time.perf_counter_ns()
+            message = {
+                "type": "PING",
+                "node": node_name,
+                "payload": METRIC_LATENCY_PAYLOAD.decode("ascii")
+            }
+            encoded = json.dumps(message, sort_keys=True).encode("utf-8")
+            digest = hashlib.sha256(encoded).hexdigest()
+            _ = self.nodes.get(node_name)
+            _ = digest
+            elapsed_ms = (time.perf_counter_ns() - start) / 1_000_000.0
+            timings.append(elapsed_ms)
+
+        return float(sum(timings) / len(timings))
+
+    def _software_throughput_tps(self):
+        """Calculate committed transaction throughput over the last 60 seconds."""
+        recent = self._recent_transactions()
+        if not recent:
+            return 0.0
+
+        timestamps = [float(block.timestamp) for block, _ in recent]
+        oldest = min(timestamps)
+        elapsed = max(time.time() - oldest, 1.0)
+        elapsed = min(elapsed, THROUGHPUT_WINDOW_SECONDS)
+        return float(len(recent) / elapsed)
+
+    def _software_energy_joules_per_min(self):
+        """
+        Estimate software energy consumption from Python CPU time.
+
+        Energy = CPU_time_seconds * assumed_CPU_power_watts.
+        The result is normalized to joules/minute. This is an estimate, not
+        a physical power measurement.
+        """
+        wall_elapsed = max(time.perf_counter() - METRICS_WALL_START, 1e-6)
+        cpu_elapsed = max(time.process_time() - METRICS_PROCESS_START, 0.0)
+        cpu_utilization = min(cpu_elapsed / wall_elapsed, 1.0)
+        return float(cpu_utilization * SOFTWARE_CPU_POWER_WATTS * 60.0)
+
+    def _software_security_risk_score(self):
+        """Use the latest GNN risk score already produced by this application."""
+        candidates = []
+        for tx in self.pending_transactions:
+            risk = tx.get("risk_assessment", {}) if isinstance(tx, dict) else {}
+            if "risk_score" in risk:
+                candidates.append(float(risk["risk_score"]))
+
+        for block in reversed(self.chain):
+            for tx in reversed(block.transactions):
+                if isinstance(tx, dict):
+                    risk = tx.get("risk_assessment", {})
+                    if "risk_score" in risk:
+                        candidates.append(float(risk["risk_score"]))
+                        break
+            if candidates:
+                break
+
+        return float(candidates[-1]) if candidates else 0.0
+
+    def _software_vehicle_count_proxy(self):
+        """
+        No physical vehicle layer exists in this project. Therefore the ML
+        feature 'vehicle_count' is represented by the number of unique
+        transaction clients (owners/users) currently visible in the software
+        workload. This is a workload proxy, not a claim of physical vehicles.
+        """
+        clients = set()
+        for tx in self.pending_transactions:
+            if isinstance(tx, dict):
+                for key in ("old_owner", "new_owner"):
+                    value = tx.get(key)
+                    if value:
+                        clients.add(str(value))
+
+        for block, tx in self._recent_transactions():
+            for key in ("old_owner", "new_owner"):
+                value = tx.get(key)
+                if value:
+                    clients.add(str(value))
+
+        return float(len(clients))
+
+    def _software_vehicle_variability_proxy(self):
+        """
+        Calculate workload-client variability from recent committed blocks.
+        Each block contributes its number of unique transaction clients; the
+        population standard deviation is used.
+        """
+        block_counts = []
+        for block in self.chain:
+            if block.index == 0:
+                continue
+            clients = set()
+            for tx in block.transactions:
+                if isinstance(tx, dict) and "land_id" in tx:
+                    for key in ("old_owner", "new_owner"):
+                        value = tx.get(key)
+                        if value:
+                            clients.add(str(value))
+            if clients:
+                block_counts.append(len(clients))
+
+        if len(block_counts) <= 1:
+            return 0.0
+
+        mean = sum(block_counts) / len(block_counts)
+        variance = sum((x - mean) ** 2 for x in block_counts) / len(block_counts)
+        return float(variance ** 0.5)
+
+    def _software_fault_tolerance_requirement(self):
+        """PBFT-style Byzantine fault requirement from the current node count."""
+        n = len(self.nodes)
+        return float(max(0, (n - 1) // 3))
+
+    def calculate_current_network_metrics(self):
+        """Calculate all eight ML features from the current software state."""
+        metrics = {
+            'node_count': float(len(self.nodes)),
+            'network_latency_ms': self._software_node_latency_ms(),
+            'tx_throughput_tps': self._software_throughput_tps(),
+            'energy_joules_per_min': self._software_energy_joules_per_min(),
+            'security_risk_score': self._software_security_risk_score(),
+            'vehicle_count': self._software_vehicle_count_proxy(),
+            'vehicle_count_variability': self._software_vehicle_variability_proxy(),
+            'fault_tolerance_requirement': self._software_fault_tolerance_requirement()
+        }
+        self.network_metrics = metrics
+        return metrics
+
+    def get_current_network_metrics(self) -> Dict[str, Any]:
+        """Return freshly calculated current network metrics."""
+        return self.calculate_current_network_metrics()
+
+    def update_network_metrics(self, metrics: Dict[str, Any]):
+        """
+        Deprecated manual metric injection. Runtime metrics are calculated from
+        the simulation and are not accepted from arbitrary client input.
+        """
+        if metrics:
+            print("ℹ️ Manual network metric injection ignored; metrics are calculated from the software simulation.")
+        return self.calculate_current_network_metrics()
+
+    def get_missing_ml_metrics(self) -> List[str]:
+        """Return ML features that cannot be calculated."""
+        current = self.get_current_network_metrics()
+        return [feature for feature in ML_EXPECTED_FEATURES if current.get(feature) is None]
+
+    def is_consensus_feasible(self, consensus: str):
+        """Check whether the selected consensus can run on the live network."""
+        node_count = len(self.nodes)
+
+        if node_count < 1:
+            return False, "At least one blockchain node is required."
+
+        if consensus == 'PBFT' and node_count < 4:
+            return False, f"PBFT requires at least 4 nodes; current nodes: {node_count}."
+
+        if consensus == 'HotStuff' and node_count < 3:
+            return False, f"HotStuff requires at least 3 nodes; current nodes: {node_count}."
+
+        # The simplified Raft implementation below needs at least one node.
+        if consensus == 'Raft' and node_count < 1:
+            return False, "Raft requires at least one node."
+
+        return True, "Consensus is feasible."
+
+    def predict_consensus_from_current_network(self):
+        """
+        Predict consensus using ONLY the current runtime network state.
+        No training CSV row is used here.
+        """
+        if not model_ready:
+            return None, {
+                'success': False,
+                'message': 'Consensus ML model is not ready.'
+            }
+
+        current_metrics = self.get_current_network_metrics()
+        missing = [
+            feature for feature in ML_EXPECTED_FEATURES
+            if current_metrics.get(feature) is None
+        ]
+
+        if missing:
+            return None, {
+                'success': False,
+                'message': 'Current network metrics are incomplete.',
+                'missing_features': missing,
+                'metrics': current_metrics
+            }
+
+        try:
+            features_df = pd.DataFrame(
+                [[current_metrics[feature] for feature in ML_EXPECTED_FEATURES]],
+                columns=ML_EXPECTED_FEATURES
+            ).astype(float)
+
+            scaled_features = scaler.transform(features_df.values)
+
+            prediction = model.predict(scaled_features)[0]
+            predicted_consensus = str(
+                label_encoder.inverse_transform([prediction])[0]
+            )
+
+            if predicted_consensus not in self.consensus_algos:
+                return None, {
+                    'success': False,
+                    'message': (
+                        f"Model returned unsupported consensus "
+                        f"'{predicted_consensus}'."
+                    ),
+                    'metrics': current_metrics
+                }
+
+            feasible, feasibility_message = \
+                self.is_consensus_feasible(predicted_consensus)
+
+            self.last_consensus_prediction = predicted_consensus
+            self.last_consensus_prediction_metrics = dict(current_metrics)
+
+            return predicted_consensus, {
+                'success': True,
+                'metrics': current_metrics,
+                'feasible': feasible,
+                'feasibility_message': feasibility_message
+            }
+
+        except Exception as e:
+            return None, {
+                'success': False,
+                'message': f"Current-network ML prediction failed: {e}",
+                'metrics': current_metrics
+            }
+
     def set_consensus(self, mode):
         if mode in self.consensus_algos:
             self.consensus_mode = mode
@@ -525,11 +829,9 @@ class Network:
         f = (n - 1) // 3
         quorum = 2 * f + 1
 
-        # Assume honest majority (simulation)
-        commit_count = n - f - 1  # excluding proposer
-
-        # Debug (optional)
-        # print(f"PBFT commit votes: {commit_count}, quorum: {quorum}")
+        # Software simulation: every configured node participates in the
+        # commit phase, so the available votes are n.
+        commit_count = n
 
         if commit_count >= quorum:
             self.pending_transactions.pop(0)
@@ -540,9 +842,14 @@ class Network:
 
 
     def run_raft(self, proposer_node: str) -> Block:
-        leader = random.choice(list(self.nodes.keys()))
-        if leader != proposer_node:
-             return None
+        if not self.nodes:
+            return None
+
+        # Simplified Raft simulation:
+        # the proposer selected for this consensus round is the leader.
+        # We do not independently randomize another leader, which previously
+        # caused an artificial proposer/leader mismatch and random failures.
+        leader = proposer_node
 
         last_block = self.get_last_block()
         new_block = Block(
@@ -583,7 +890,9 @@ class Network:
         if not self.pending_transactions:
             return {'success': False, 'result': 'No pending transactions to process.'}
 
-        proposer_node = random.choice(list(self.nodes.keys()))
+        # Deterministic proposer selection for reproducible software simulation.
+        node_names = sorted(self.nodes.keys())
+        proposer_node = node_names[len(self.chain) % len(node_names)]
         new_block = None
 
         if self.consensus_mode == 'PoW':
@@ -644,6 +953,15 @@ def save_network_state():
 
             'consensus_algos':
                 network.consensus_algos,
+
+            'network_metrics':
+                network.network_metrics,
+
+            'last_consensus_prediction':
+                network.last_consensus_prediction,
+
+            'last_consensus_prediction_metrics':
+                network.last_consensus_prediction_metrics,
 
             'active_users':
                 network.active_users,
@@ -789,6 +1107,29 @@ def load_network_state():
                 ]
             )
 
+            network.network_metrics = state.get(
+                'network_metrics',
+                {
+                    'network_latency_ms': None,
+                    'tx_throughput_tps': None,
+                    'energy_joules_per_min': None,
+                    'security_risk_score': None,
+                    'vehicle_count': None,
+                    'vehicle_count_variability': None,
+                    'fault_tolerance_requirement': None
+                }
+            )
+
+            network.last_consensus_prediction = state.get(
+                'last_consensus_prediction',
+                'PoW'
+            )
+
+            network.last_consensus_prediction_metrics = state.get(
+                'last_consensus_prediction_metrics',
+                {}
+            )
+
             # --------------------------------
             # Restore users
             # --------------------------------
@@ -841,27 +1182,15 @@ def load_network_state():
 
     ensure_default_users()
 def online_update(features_scaled, true_label_str):
-    global model
-
-    if not model_ready:
-        return
-
-    try:
-        # encode real label from dataset
-        true_label_encoded = label_encoder.transform([true_label_str])[0]
-
-        model.partial_fit(
-            features_scaled,
-            np.array([true_label_encoded])
-        )
-
-
-        joblib.dump(model, MODEL_PATH)
-
-        print(f"⚡ Learned from real label: {true_label_str}")
-
-    except Exception as e:
-        print("Online update error:", e)
+    """
+    Retained for backward compatibility, but disabled for runtime consensus
+    selection. A model prediction is not a ground-truth label, so the runtime
+    code must not train on a random CSV label.
+    """
+    print(
+        "ℹ️ Runtime online_update skipped: "
+        "a ground-truth consensus label is required before supervised updating."
+    )
 
 
 def ensure_default_users():
@@ -1086,6 +1415,20 @@ def get_state():
         'difficulty': network.difficulty,
         'consensus_algos': network.consensus_algos,
         'ml_ready': model_ready,
+        'network_metrics': network.get_current_network_metrics(),
+        'network_metric_sources': {
+            'node_count': 'len(network.nodes)',
+            'network_latency_ms': 'software node ping/processing measurement',
+            'tx_throughput_tps': 'committed transactions in the last 60 seconds',
+            'energy_joules_per_min': 'CPU-time energy estimate using SOFTWARE_CPU_POWER_WATTS',
+            'security_risk_score': 'latest GNN risk assessment',
+            'vehicle_count': 'unique transaction-client workload proxy',
+            'vehicle_count_variability': 'standard deviation of recent block client counts',
+            'fault_tolerance_requirement': 'floor((node_count - 1) / 3)'
+        },
+        'missing_ml_metrics': network.get_missing_ml_metrics(),
+        'last_consensus_prediction': network.last_consensus_prediction,
+        'last_consensus_prediction_metrics': network.last_consensus_prediction_metrics,
         'last_block_hash': last_block.hash(),
         'node_count': len(network.nodes),
         'current_user': session.get('username', 'Guest')
@@ -1180,6 +1523,27 @@ def remove_node():
     success = network.remove_node(name)
     return jsonify({'success': success, 'message': f"Node {name} removed."})
 
+@app.route('/api/network_metrics', methods=['GET'])
+def network_metrics_route():
+    """Return freshly calculated software-only network metrics."""
+    load_network_state()
+    metrics = network.get_current_network_metrics()
+    return jsonify({
+        'success': True,
+        'metrics': metrics,
+        'sources': {
+            'node_count': 'len(network.nodes)',
+            'network_latency_ms': 'software node ping/processing measurement',
+            'tx_throughput_tps': 'committed transactions in the last 60 seconds',
+            'energy_joules_per_min': 'CPU-time energy estimate using SOFTWARE_CPU_POWER_WATTS',
+            'security_risk_score': 'latest GNN risk assessment',
+            'vehicle_count': 'unique transaction-client workload proxy',
+            'vehicle_count_variability': 'standard deviation of recent block client counts',
+            'fault_tolerance_requirement': 'floor((node_count - 1) / 3)'
+        }
+    })
+
+
 @app.route('/api/add_land_tx', methods=['POST'])
 
 def add_land_tx():
@@ -1245,41 +1609,91 @@ def add_land_tx():
         len(network.pending_transactions)
     )
 
-    # ---- ML Consensus Prediction (UNCHANGED) ----
+    # ---- CURRENT NETWORK ML CONSENSUS PREDICTION ----
     predicted_consensus = network.consensus_mode
+    prediction_info = {
+        'success': False,
+        'message': 'ML prediction not performed.'
+    }
+
     if model_ready:
-        try:
-            random_row = df_traffic.sample(n=1)
+        predicted_consensus_ml, prediction_info = \
+            network.predict_consensus_from_current_network()
 
-            # features
-            features_df = random_row[MODEL_FEATURES]
-            scaled_features = scaler.transform(features_df.values)
+        if predicted_consensus_ml is not None:
+            if prediction_info.get('feasible', False):
+                predicted_consensus = predicted_consensus_ml
+                network.set_consensus(predicted_consensus)
 
-            # prediction
-            prediction = model.predict(scaled_features)[0]
-            predicted_consensus = label_encoder.inverse_transform([prediction])[0]
-
-            # TRUE LABEL from dataset
-            true_label = random_row['consensus'].values[0]
-
-            correct = predicted_consensus == true_label
-            print(f"Prediction: {predicted_consensus} | True: {true_label} | Correct: {correct}")
-
-            # online supervised learning
-            online_update(scaled_features, true_label)
-
-            network.set_consensus(predicted_consensus)
-
-        except Exception as e:
-            print("ML error:", e)
+                print(
+                    f"🧠 Current-network ML selected: "
+                    f"{predicted_consensus}"
+                )
+            else:
+                print(
+                    "⚠️ ML selected an infeasible consensus: "
+                    f"{predicted_consensus_ml}"
+                )
+                print(
+                    prediction_info.get(
+                        'feasibility_message',
+                        'Consensus is not feasible.'
+                    )
+                )
+                prediction_info['success'] = False
+                prediction_info['message'] = (
+                    prediction_info.get(
+                        'feasibility_message',
+                        'Predicted consensus is not feasible.'
+                    )
+                )
+                predicted_consensus = network.consensus_mode
+        else:
+            print(
+                "⚠️ Current-network ML prediction was not performed: "
+                f"{prediction_info.get('message')}"
+            )
+    else:
+        print("⚠️ Consensus ML model is not ready; keeping current consensus.")
 
 
     result["predicted_consensus"] = predicted_consensus
+    result["consensus_ml"] = prediction_info
 
     return jsonify({
         'success': True,
         'message': 'Land transaction added to queue.',
         'transaction': result
+    })
+
+
+@app.route('/api/predict_consensus', methods=['GET'])
+def predict_consensus_route():
+    """
+    Test the current-network ML prediction without adding a transaction.
+    This is useful for validating Module 4.
+    """
+    load_network_state()
+
+    if not model_ready:
+        return jsonify({
+            'success': False,
+            'message': 'Consensus ML model is not ready.'
+        }), 503
+
+    predicted, info = network.predict_consensus_from_current_network()
+
+    if predicted is None:
+        return jsonify({
+            'success': False,
+            'message': info.get('message', 'Prediction failed.'),
+            'details': info
+        }), 400
+
+    return jsonify({
+        'success': True,
+        'predicted_consensus': predicted,
+        'details': info
     })
 
 
