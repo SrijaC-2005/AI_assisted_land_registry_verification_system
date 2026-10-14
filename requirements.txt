@@ -4,3 +4,7 @@ numpy
 joblib
 quantcrypt
 werkzeug
+torch
+torch-geometric
+shap
+lime

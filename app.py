@@ -1,8 +1,9 @@
 from flask import Flask, request, jsonify, render_template_string, redirect, url_for, session
-import time, json, hashlib, random
+import time, json, hashlib, random, copy
 from datetime import datetime
 from risk_assessment.predict import assess_transaction
 from risk_assessment.model import LandFraudGNN
+from consensus_explainer import explain_consensus
 from typing import List, Dict, Any
 import os, uuid, itertools
 import csv
@@ -11,6 +12,11 @@ from numpy import block
 from werkzeug.security import generate_password_hash, check_password_hash
 import hashlib
 import base64
+
+try:
+    from real_dataset_graph import RealDatasetGraph
+except Exception:
+    RealDatasetGraph = None
 
 from quantcrypt import dss
 
@@ -29,20 +35,27 @@ MODEL_PATH = os.path.join(BASE_DIR, "FL_SGD", "federated_sgd_global_model.pkl")
 LABEL_ENCODER_PATH = os.path.join(BASE_DIR, "FL_SGD", "fed_label_encoder.pkl")
 SCALER_PATH = os.path.join(BASE_DIR, "FL_SGD", "fed_scaler.pkl")
 DATA_PATH = os.path.join(BASE_DIR, "Dataset", "Current_Network_Metrics.csv")
+CONSENSUS_SELECTOR_DIR = os.path.join(BASE_DIR, "FL_SGD", "consensus_selector")
+CONSENSUS_SELECTOR_MODEL_PATH = os.path.join(CONSENSUS_SELECTOR_DIR, "model.pkl")
+CONSENSUS_SELECTOR_SCALER_PATH = os.path.join(CONSENSUS_SELECTOR_DIR, "scaler.pkl")
+CONSENSUS_SELECTOR_ENCODER_PATH = os.path.join(CONSENSUS_SELECTOR_DIR, "label_encoder.pkl")
 
 NETWORK_STATE_FILE = os.path.join(BASE_DIR, "Blockchain_Ledger.json") # New file for state persistence
 USERS: Dict[str, str] = {} # {username: hashed_password}
 MAX_NODES = 5
 
-# Software-only network metric configuration.
-# These are deterministic calculations from this Flask process; no random
-# values and no external hardware are used. The power value is an explicit
-# software energy-model assumption, not a physical measurement.
-SOFTWARE_CPU_POWER_WATTS = 50.0
-THROUGHPUT_WINDOW_SECONDS = 60.0
-METRIC_LATENCY_PAYLOAD = b'LAND_REGISTRY_NODE_PING'
-METRICS_PROCESS_START = time.process_time()
-METRICS_WALL_START = time.perf_counter()
+# Interactive graph service. This is separate from
+# risk_assessment/graph_builder.py, which remains the GNN graph builder.
+# Prefer the mixed HM Land Registry + augmented-owner dataset when supplied.
+# This archive does not include that JSON, so fall back to the included CSV.
+MIXED_GRAPH_DATASET_PATH = os.path.join(BASE_DIR, "real_augmented_transactions.json")
+GRAPH_DATASET_PATH = (
+    MIXED_GRAPH_DATASET_PATH
+    if os.path.exists(MIXED_GRAPH_DATASET_PATH)
+    else os.path.join(BASE_DIR, "Dataset", "land_transactions.csv")
+)
+GRAPH_NODES_FILE = os.path.join(BASE_DIR, "Graph_Nodes.json")
+real_graph = RealDatasetGraph(GRAPH_DATASET_PATH, GRAPH_NODES_FILE) if RealDatasetGraph else None
 
 
 # --- Credential Management Functions (Unchanged) ---
@@ -94,77 +107,50 @@ def save_users_to_csv():
     except Exception as e:
         print(f"❌ Error saving credentials: {e}")
 
-# --- ML Model Setup ---
-# The CSV is used for training/validation only. Runtime prediction NEVER samples
-# a random row from the CSV.
+# --- ML Model and Data Setup (Unchanged in logic) ---
 try:
     import pandas as pd
     import numpy as np
     import joblib
-
+    
     model_ready = False
     model = None
     label_encoder = None
-    scaler = None
     df_traffic = None
+    scaler = None
 
     ML_EXPECTED_FEATURES = [
-        'node_count',
-        'network_latency_ms',
-        'tx_throughput_tps',
-        'energy_joules_per_min',
-        'security_risk_score',
-        'vehicle_count',
-        'vehicle_count_variability',
+        'node_count', 
+        'network_latency_ms', 
+        'tx_throughput_tps', 
+        'energy_joules_per_min', 
+        'security_risk_score', 
+        'vehicle_count', 
+        'vehicle_count_variability', 
         'fault_tolerance_requirement'
     ]
+    MODEL_FEATURES = []
 
-    MODEL_FEATURES = ML_EXPECTED_FEATURES.copy()
-
-    # The model, encoder and scaler are the runtime assets.
-    # The dataset is NOT required for runtime prediction.
-    if (
-        os.path.exists(MODEL_PATH)
-        and os.path.exists(LABEL_ENCODER_PATH)
-        and os.path.exists(SCALER_PATH)
-    ):
+    if os.path.exists(MODEL_PATH) and os.path.exists(LABEL_ENCODER_PATH) and os.path.exists(DATA_PATH) and os.path.exists(SCALER_PATH):
         try:
             model = joblib.load(MODEL_PATH)
             label_encoder = joblib.load(LABEL_ENCODER_PATH)
             scaler = joblib.load(SCALER_PATH)
 
-            if os.path.exists(DATA_PATH):
-                try:
-                    df_traffic = pd.read_csv(DATA_PATH)
-                    missing = [
-                        f for f in ML_EXPECTED_FEATURES
-                        if f not in df_traffic.columns
-                    ]
-                    if missing:
-                        print(
-                            "⚠️ Training dataset is missing features:",
-                            missing
-                        )
-                    else:
-                        print(
-                            "📊 Training dataset loaded for reference only."
-                        )
-                except Exception as e:
-                    print(f"⚠️ Could not read training dataset: {e}")
+            df_traffic = pd.read_csv(DATA_PATH)
+            MODEL_FEATURES = ML_EXPECTED_FEATURES
 
-            model_ready = True
-            print(
-                "🧠 Federated SGD model, scaler and label encoder loaded. "
-                "Runtime prediction uses current network metrics only."
-            )
+            if not all(feature in df_traffic.columns for feature in ML_EXPECTED_FEATURES):
+                print("❌ Missing ML features.")
+            else:
+                model_ready = True
+                print("🧠 Federated SGD model loaded. Dynamic consensus active.")
 
         except Exception as e:
             print(f"⚠️ Failed to load ML assets: {e}")
+
     else:
-        print(
-            "⚠️ ML model/scaler/encoder files not found. "
-            "Running in static consensus mode."
-        )
+        print("⚠️ ML files not found. Running in static consensus mode.")
 
 except Exception as e:
     print(f"⚠️ ML library imports failed. Error: {e}")
@@ -172,6 +158,33 @@ except Exception as e:
     pd = None
     np = None
     joblib = None
+
+
+# Snapshot of the actual existing dynamic-consensus decision, used only for explanation.
+last_consensus_decision = None
+
+# Separate consensus-selector artifacts: never overwrite the existing federated fraud model.
+selector_model = selector_scaler = selector_label_encoder = None
+selector_ready = False
+selector_training_frame = None
+try:
+    import pandas as pd
+    import joblib
+    if all(os.path.exists(path) for path in (
+        CONSENSUS_SELECTOR_MODEL_PATH, CONSENSUS_SELECTOR_SCALER_PATH,
+        CONSENSUS_SELECTOR_ENCODER_PATH, DATA_PATH
+    )):
+        selector_model = joblib.load(CONSENSUS_SELECTOR_MODEL_PATH)
+        selector_scaler = joblib.load(CONSENSUS_SELECTOR_SCALER_PATH)
+        selector_label_encoder = joblib.load(CONSENSUS_SELECTOR_ENCODER_PATH)
+        selector_training_frame = pd.read_csv(DATA_PATH)
+        selector_ready = True
+        print("🧠 Trained consensus selector loaded; Module 4 LIME explains this classifier.")
+    else:
+        print("⚠️ Trained consensus selector not found. Run python train_consensus_selector.py.")
+except Exception as selector_load_error:
+    print(f"⚠️ Consensus selector unavailable: {selector_load_error}")
+    selector_ready = False
 
 
 app = Flask(__name__)
@@ -260,11 +273,6 @@ class Network:
         self.consensus_mode: str = 'PoW'
         self.difficulty: int = 3
         self.consensus_algos: List[str] = ['PoW', 'PoS', 'Raft', 'PBFT', 'HotStuff']
-        # Runtime network metrics are calculated from the software simulation.
-        # No random dataset row is used for runtime inference.
-        self.network_metrics: Dict[str, Any] = {}
-        self.last_consensus_prediction: str = 'PoW'
-        self.last_consensus_prediction_metrics: Dict[str, Any] = {}
         self.active_users: Dict[str, bool] = {} # {username: True}
         self.pending_users: Dict[str, List[str]] = {} # {username: [voter1, voter2, ...]}
         self.add_node('Node-A', is_initial=True)
@@ -479,268 +487,6 @@ class Network:
 
         return True, tx
 
-    def _recent_transactions(self, window_seconds=THROUGHPUT_WINDOW_SECONDS):
-        """Return blockchain transactions committed within the measurement window."""
-        now = time.time()
-        recent = []
-        for block in self.chain:
-            if block.index == 0:
-                continue
-            if now - float(block.timestamp) <= window_seconds:
-                for tx in block.transactions:
-                    if isinstance(tx, dict) and "land_id" in tx:
-                        recent.append((block, tx))
-        return recent
-
-    def _software_node_latency_ms(self):
-        """
-        Measure application-level node communication work inside this Flask
-        process. Each configured node receives the same ping payload, performs
-        serialization/hash work, and is looked up in the node table.
-
-        This is a software-emulated network latency metric, not physical
-        network RTT, because all simulated nodes live in one Python process.
-        """
-        if not self.nodes:
-            return 0.0
-
-        timings = []
-        for node_name in self.nodes:
-            start = time.perf_counter_ns()
-            message = {
-                "type": "PING",
-                "node": node_name,
-                "payload": METRIC_LATENCY_PAYLOAD.decode("ascii")
-            }
-            encoded = json.dumps(message, sort_keys=True).encode("utf-8")
-            digest = hashlib.sha256(encoded).hexdigest()
-            _ = self.nodes.get(node_name)
-            _ = digest
-            elapsed_ms = (time.perf_counter_ns() - start) / 1_000_000.0
-            timings.append(elapsed_ms)
-
-        return float(sum(timings) / len(timings))
-
-    def _software_throughput_tps(self):
-        """Calculate committed transaction throughput over the last 60 seconds."""
-        recent = self._recent_transactions()
-        if not recent:
-            return 0.0
-
-        timestamps = [float(block.timestamp) for block, _ in recent]
-        oldest = min(timestamps)
-        elapsed = max(time.time() - oldest, 1.0)
-        elapsed = min(elapsed, THROUGHPUT_WINDOW_SECONDS)
-        return float(len(recent) / elapsed)
-
-    def _software_energy_joules_per_min(self):
-        """
-        Estimate software energy consumption from Python CPU time.
-
-        Energy = CPU_time_seconds * assumed_CPU_power_watts.
-        The result is normalized to joules/minute. This is an estimate, not
-        a physical power measurement.
-        """
-        wall_elapsed = max(time.perf_counter() - METRICS_WALL_START, 1e-6)
-        cpu_elapsed = max(time.process_time() - METRICS_PROCESS_START, 0.0)
-        cpu_utilization = min(cpu_elapsed / wall_elapsed, 1.0)
-        return float(cpu_utilization * SOFTWARE_CPU_POWER_WATTS * 60.0)
-
-    def _software_security_risk_score(self):
-        """Use the latest GNN risk score already produced by this application."""
-        candidates = []
-        for tx in self.pending_transactions:
-            risk = tx.get("risk_assessment", {}) if isinstance(tx, dict) else {}
-            if "risk_score" in risk:
-                candidates.append(float(risk["risk_score"]))
-
-        for block in reversed(self.chain):
-            for tx in reversed(block.transactions):
-                if isinstance(tx, dict):
-                    risk = tx.get("risk_assessment", {})
-                    if "risk_score" in risk:
-                        candidates.append(float(risk["risk_score"]))
-                        break
-            if candidates:
-                break
-
-        return float(candidates[-1]) if candidates else 0.0
-
-    def _software_vehicle_count_proxy(self):
-        """
-        No physical vehicle layer exists in this project. Therefore the ML
-        feature 'vehicle_count' is represented by the number of unique
-        transaction clients (owners/users) currently visible in the software
-        workload. This is a workload proxy, not a claim of physical vehicles.
-        """
-        clients = set()
-        for tx in self.pending_transactions:
-            if isinstance(tx, dict):
-                for key in ("old_owner", "new_owner"):
-                    value = tx.get(key)
-                    if value:
-                        clients.add(str(value))
-
-        for block, tx in self._recent_transactions():
-            for key in ("old_owner", "new_owner"):
-                value = tx.get(key)
-                if value:
-                    clients.add(str(value))
-
-        return float(len(clients))
-
-    def _software_vehicle_variability_proxy(self):
-        """
-        Calculate workload-client variability from recent committed blocks.
-        Each block contributes its number of unique transaction clients; the
-        population standard deviation is used.
-        """
-        block_counts = []
-        for block in self.chain:
-            if block.index == 0:
-                continue
-            clients = set()
-            for tx in block.transactions:
-                if isinstance(tx, dict) and "land_id" in tx:
-                    for key in ("old_owner", "new_owner"):
-                        value = tx.get(key)
-                        if value:
-                            clients.add(str(value))
-            if clients:
-                block_counts.append(len(clients))
-
-        if len(block_counts) <= 1:
-            return 0.0
-
-        mean = sum(block_counts) / len(block_counts)
-        variance = sum((x - mean) ** 2 for x in block_counts) / len(block_counts)
-        return float(variance ** 0.5)
-
-    def _software_fault_tolerance_requirement(self):
-        """PBFT-style Byzantine fault requirement from the current node count."""
-        n = len(self.nodes)
-        return float(max(0, (n - 1) // 3))
-
-    def calculate_current_network_metrics(self):
-        """Calculate all eight ML features from the current software state."""
-        metrics = {
-            'node_count': float(len(self.nodes)),
-            'network_latency_ms': self._software_node_latency_ms(),
-            'tx_throughput_tps': self._software_throughput_tps(),
-            'energy_joules_per_min': self._software_energy_joules_per_min(),
-            'security_risk_score': self._software_security_risk_score(),
-            'vehicle_count': self._software_vehicle_count_proxy(),
-            'vehicle_count_variability': self._software_vehicle_variability_proxy(),
-            'fault_tolerance_requirement': self._software_fault_tolerance_requirement()
-        }
-        self.network_metrics = metrics
-        return metrics
-
-    def get_current_network_metrics(self) -> Dict[str, Any]:
-        """Return freshly calculated current network metrics."""
-        return self.calculate_current_network_metrics()
-
-    def update_network_metrics(self, metrics: Dict[str, Any]):
-        """
-        Deprecated manual metric injection. Runtime metrics are calculated from
-        the simulation and are not accepted from arbitrary client input.
-        """
-        if metrics:
-            print("ℹ️ Manual network metric injection ignored; metrics are calculated from the software simulation.")
-        return self.calculate_current_network_metrics()
-
-    def get_missing_ml_metrics(self) -> List[str]:
-        """Return ML features that cannot be calculated."""
-        current = self.get_current_network_metrics()
-        return [feature for feature in ML_EXPECTED_FEATURES if current.get(feature) is None]
-
-    def is_consensus_feasible(self, consensus: str):
-        """Check whether the selected consensus can run on the live network."""
-        node_count = len(self.nodes)
-
-        if node_count < 1:
-            return False, "At least one blockchain node is required."
-
-        if consensus == 'PBFT' and node_count < 4:
-            return False, f"PBFT requires at least 4 nodes; current nodes: {node_count}."
-
-        if consensus == 'HotStuff' and node_count < 3:
-            return False, f"HotStuff requires at least 3 nodes; current nodes: {node_count}."
-
-        # The simplified Raft implementation below needs at least one node.
-        if consensus == 'Raft' and node_count < 1:
-            return False, "Raft requires at least one node."
-
-        return True, "Consensus is feasible."
-
-    def predict_consensus_from_current_network(self):
-        """
-        Predict consensus using ONLY the current runtime network state.
-        No training CSV row is used here.
-        """
-        if not model_ready:
-            return None, {
-                'success': False,
-                'message': 'Consensus ML model is not ready.'
-            }
-
-        current_metrics = self.get_current_network_metrics()
-        missing = [
-            feature for feature in ML_EXPECTED_FEATURES
-            if current_metrics.get(feature) is None
-        ]
-
-        if missing:
-            return None, {
-                'success': False,
-                'message': 'Current network metrics are incomplete.',
-                'missing_features': missing,
-                'metrics': current_metrics
-            }
-
-        try:
-            features_df = pd.DataFrame(
-                [[current_metrics[feature] for feature in ML_EXPECTED_FEATURES]],
-                columns=ML_EXPECTED_FEATURES
-            ).astype(float)
-
-            scaled_features = scaler.transform(features_df.values)
-
-            prediction = model.predict(scaled_features)[0]
-            predicted_consensus = str(
-                label_encoder.inverse_transform([prediction])[0]
-            )
-
-            if predicted_consensus not in self.consensus_algos:
-                return None, {
-                    'success': False,
-                    'message': (
-                        f"Model returned unsupported consensus "
-                        f"'{predicted_consensus}'."
-                    ),
-                    'metrics': current_metrics
-                }
-
-            feasible, feasibility_message = \
-                self.is_consensus_feasible(predicted_consensus)
-
-            self.last_consensus_prediction = predicted_consensus
-            self.last_consensus_prediction_metrics = dict(current_metrics)
-
-            return predicted_consensus, {
-                'success': True,
-                'metrics': current_metrics,
-                'feasible': feasible,
-                'feasibility_message': feasibility_message
-            }
-
-        except Exception as e:
-            return None, {
-                'success': False,
-                'message': f"Current-network ML prediction failed: {e}",
-                'metrics': current_metrics
-            }
-
     def set_consensus(self, mode):
         if mode in self.consensus_algos:
             self.consensus_mode = mode
@@ -829,9 +575,11 @@ class Network:
         f = (n - 1) // 3
         quorum = 2 * f + 1
 
-        # Software simulation: every configured node participates in the
-        # commit phase, so the available votes are n.
-        commit_count = n
+        # Assume honest majority (simulation)
+        commit_count = n - f - 1  # excluding proposer
+
+        # Debug (optional)
+        # print(f"PBFT commit votes: {commit_count}, quorum: {quorum}")
 
         if commit_count >= quorum:
             self.pending_transactions.pop(0)
@@ -842,14 +590,9 @@ class Network:
 
 
     def run_raft(self, proposer_node: str) -> Block:
-        if not self.nodes:
-            return None
-
-        # Simplified Raft simulation:
-        # the proposer selected for this consensus round is the leader.
-        # We do not independently randomize another leader, which previously
-        # caused an artificial proposer/leader mismatch and random failures.
-        leader = proposer_node
+        leader = random.choice(list(self.nodes.keys()))
+        if leader != proposer_node:
+             return None
 
         last_block = self.get_last_block()
         new_block = Block(
@@ -890,9 +633,7 @@ class Network:
         if not self.pending_transactions:
             return {'success': False, 'result': 'No pending transactions to process.'}
 
-        # Deterministic proposer selection for reproducible software simulation.
-        node_names = sorted(self.nodes.keys())
-        proposer_node = node_names[len(self.chain) % len(node_names)]
+        proposer_node = random.choice(list(self.nodes.keys()))
         new_block = None
 
         if self.consensus_mode == 'PoW':
@@ -953,15 +694,6 @@ def save_network_state():
 
             'consensus_algos':
                 network.consensus_algos,
-
-            'network_metrics':
-                network.network_metrics,
-
-            'last_consensus_prediction':
-                network.last_consensus_prediction,
-
-            'last_consensus_prediction_metrics':
-                network.last_consensus_prediction_metrics,
 
             'active_users':
                 network.active_users,
@@ -1107,29 +839,6 @@ def load_network_state():
                 ]
             )
 
-            network.network_metrics = state.get(
-                'network_metrics',
-                {
-                    'network_latency_ms': None,
-                    'tx_throughput_tps': None,
-                    'energy_joules_per_min': None,
-                    'security_risk_score': None,
-                    'vehicle_count': None,
-                    'vehicle_count_variability': None,
-                    'fault_tolerance_requirement': None
-                }
-            )
-
-            network.last_consensus_prediction = state.get(
-                'last_consensus_prediction',
-                'PoW'
-            )
-
-            network.last_consensus_prediction_metrics = state.get(
-                'last_consensus_prediction_metrics',
-                {}
-            )
-
             # --------------------------------
             # Restore users
             # --------------------------------
@@ -1182,15 +891,27 @@ def load_network_state():
 
     ensure_default_users()
 def online_update(features_scaled, true_label_str):
-    """
-    Retained for backward compatibility, but disabled for runtime consensus
-    selection. A model prediction is not a ground-truth label, so the runtime
-    code must not train on a random CSV label.
-    """
-    print(
-        "ℹ️ Runtime online_update skipped: "
-        "a ground-truth consensus label is required before supervised updating."
-    )
+    global model
+
+    if not model_ready:
+        return
+
+    try:
+        # encode real label from dataset
+        true_label_encoded = label_encoder.transform([true_label_str])[0]
+
+        model.partial_fit(
+            features_scaled,
+            np.array([true_label_encoded])
+        )
+
+
+        joblib.dump(model, MODEL_PATH)
+
+        print(f"⚡ Learned from real label: {true_label_str}")
+
+    except Exception as e:
+        print("Online update error:", e)
 
 
 def ensure_default_users():
@@ -1388,6 +1109,130 @@ def index():
     
     return render_template_string(INDEX_HTML)
 
+def _all_transactions_flat():
+    """Flatten ledger + pending transactions for graph construction."""
+    txs = []
+    for block in network.chain:
+        for tx in block.transactions:
+            if isinstance(tx, dict) and "land_id" in tx:
+                item = dict(tx)
+                item["source"] = "ledger"
+                item["block_index"] = block.index
+                txs.append(item)
+
+    for tx in network.pending_transactions:
+        if isinstance(tx, dict) and "land_id" in tx:
+            item = dict(tx)
+            item["source"] = "pending"
+            item["block_index"] = None
+            txs.append(item)
+
+    return txs
+
+
+def _all_graph_transactions_flat():
+    """Flatten ledger, pending and blocked transactions for graph investigation.
+
+    Blocked transactions are included only in the visualization/search layer.
+    They are never inserted into the blockchain chain by this helper.
+    """
+    txs = _all_transactions_flat()
+    for blocked_item in network.blocked_transactions:
+        tx = blocked_item.get("transaction") if isinstance(blocked_item, dict) else None
+        if not isinstance(tx, dict) or "land_id" not in tx:
+            continue
+        item = dict(tx)
+        item["source"] = "blocked"
+        item["blocked"] = True
+        item["block_index"] = None
+        txs.append(item)
+    return txs
+
+
+@app.route('/api/graph/real', methods=['GET'])
+def real_dataset_graph_route():
+    """Return interactive graph data from the mixed UK HM Land Registry + synthetic-owner dataset and live blockchain state."""
+    if real_graph is None:
+        return jsonify({
+            "success": False,
+            "message": "Graph service is unavailable because real_dataset_graph.py could not be loaded."
+        }), 500
+
+    load_network_state()
+    try:
+        limit = min(max(int(request.args.get("limit", 600)), 1), 1500)
+    except (TypeError, ValueError):
+        limit = 600
+
+    postcode = request.args.get("postcode", "").strip()
+    property_id = request.args.get("property_id", "").strip()
+    include_blockchain = request.args.get("include_blockchain", "1") != "0"
+    recent_only = request.args.get("recent_only", "0") != "0"
+    focus_type = request.args.get("focus_type", "").strip() or None
+    focus_label = request.args.get("focus_label", "").strip() or None
+    admin_only = request.args.get("admin_only", "0") == "1"
+
+    graph = real_graph.build_graph(
+        limit=limit,
+        postcode=postcode or None,
+        property_id=property_id or None,
+        recent_only=recent_only and not focus_label,
+        focus_type=focus_type,
+        focus_label=focus_label,
+        admin_only=admin_only,
+        blockchain_transactions=_all_graph_transactions_flat() if include_blockchain else [],
+        blockchain_nodes=network.nodes if include_blockchain else {},
+    )
+    return jsonify({"success": True, **graph})
+
+
+@app.route('/api/graph/add_node', methods=['POST'])
+@persist_action
+def add_graph_node():
+    if real_graph is None:
+        return jsonify({"success": False, "message": "Graph service unavailable."}), 500
+
+    data = request.json or {}
+    node_type = str(data.get("type", "Custom")).strip() or "Custom"
+    label = str(data.get("label", "")).strip()
+    if not label:
+        return jsonify({"success": False, "message": "Graph node label is required."}), 400
+
+    node = real_graph.add_custom_node(node_type, label, data.get("metadata") or {})
+    return jsonify({
+        "success": True,
+        "message": f"Graph node '{label}' added.",
+        "node": node,
+    })
+
+
+@app.route('/api/graph/add_edge', methods=['POST'])
+@persist_action
+def add_graph_edge():
+    if real_graph is None:
+        return jsonify({"success": False, "message": "Graph service unavailable."}), 500
+
+    data = request.json or {}
+    source = str(data.get("source", "")).strip()
+    target = str(data.get("target", "")).strip()
+    relation = str(data.get("relation", "RELATED_TO")).strip() or "RELATED_TO"
+
+    if not source or not target:
+        return jsonify({
+            "success": False,
+            "message": "Source and target node IDs are required."
+        }), 400
+
+    edge = real_graph.add_custom_edge(source, target, relation)
+    if not edge:
+        return jsonify({
+            "success": False,
+            "message": "Source/target node must exist in the custom graph."
+        }), 400
+
+    return jsonify({"success": True, "message": "Graph edge added.", "edge": edge})
+
+
 # --- Simulation API Routes ---
 @app.route('/api/state')
 def get_state():
@@ -1415,20 +1260,6 @@ def get_state():
         'difficulty': network.difficulty,
         'consensus_algos': network.consensus_algos,
         'ml_ready': model_ready,
-        'network_metrics': network.get_current_network_metrics(),
-        'network_metric_sources': {
-            'node_count': 'len(network.nodes)',
-            'network_latency_ms': 'software node ping/processing measurement',
-            'tx_throughput_tps': 'committed transactions in the last 60 seconds',
-            'energy_joules_per_min': 'CPU-time energy estimate using SOFTWARE_CPU_POWER_WATTS',
-            'security_risk_score': 'latest GNN risk assessment',
-            'vehicle_count': 'unique transaction-client workload proxy',
-            'vehicle_count_variability': 'standard deviation of recent block client counts',
-            'fault_tolerance_requirement': 'floor((node_count - 1) / 3)'
-        },
-        'missing_ml_metrics': network.get_missing_ml_metrics(),
-        'last_consensus_prediction': network.last_consensus_prediction,
-        'last_consensus_prediction_metrics': network.last_consensus_prediction_metrics,
         'last_block_hash': last_block.hash(),
         'node_count': len(network.nodes),
         'current_user': session.get('username', 'Guest')
@@ -1523,27 +1354,6 @@ def remove_node():
     success = network.remove_node(name)
     return jsonify({'success': success, 'message': f"Node {name} removed."})
 
-@app.route('/api/network_metrics', methods=['GET'])
-def network_metrics_route():
-    """Return freshly calculated software-only network metrics."""
-    load_network_state()
-    metrics = network.get_current_network_metrics()
-    return jsonify({
-        'success': True,
-        'metrics': metrics,
-        'sources': {
-            'node_count': 'len(network.nodes)',
-            'network_latency_ms': 'software node ping/processing measurement',
-            'tx_throughput_tps': 'committed transactions in the last 60 seconds',
-            'energy_joules_per_min': 'CPU-time energy estimate using SOFTWARE_CPU_POWER_WATTS',
-            'security_risk_score': 'latest GNN risk assessment',
-            'vehicle_count': 'unique transaction-client workload proxy',
-            'vehicle_count_variability': 'standard deviation of recent block client counts',
-            'fault_tolerance_requirement': 'floor((node_count - 1) / 3)'
-        }
-    })
-
-
 @app.route('/api/add_land_tx', methods=['POST'])
 
 def add_land_tx():
@@ -1609,56 +1419,50 @@ def add_land_tx():
         len(network.pending_transactions)
     )
 
-    # ---- CURRENT NETWORK ML CONSENSUS PREDICTION ----
+    # Preserve the project's existing dynamic-consensus pipeline: use the same
+    # labelled network-metrics row, model prediction, online update, and set_consensus.
+    # Module 4 records and explains this exact decision; it does not make a second one.
+    global last_consensus_decision
     predicted_consensus = network.consensus_mode
-    prediction_info = {
-        'success': False,
-        'message': 'ML prediction not performed.'
-    }
-
-    if model_ready:
-        predicted_consensus_ml, prediction_info = \
-            network.predict_consensus_from_current_network()
-
-        if predicted_consensus_ml is not None:
-            if prediction_info.get('feasible', False):
-                predicted_consensus = predicted_consensus_ml
-                network.set_consensus(predicted_consensus)
-
-                print(
-                    f"🧠 Current-network ML selected: "
-                    f"{predicted_consensus}"
-                )
-            else:
-                print(
-                    "⚠️ ML selected an infeasible consensus: "
-                    f"{predicted_consensus_ml}"
-                )
-                print(
-                    prediction_info.get(
-                        'feasibility_message',
-                        'Consensus is not feasible.'
-                    )
-                )
-                prediction_info['success'] = False
-                prediction_info['message'] = (
-                    prediction_info.get(
-                        'feasibility_message',
-                        'Predicted consensus is not feasible.'
-                    )
-                )
-                predicted_consensus = network.consensus_mode
+    decision_features = None
+    decision_model_snapshot = None
+    true_label = None
+    try:
+        if model_ready and df_traffic is not None and not df_traffic.empty:
+            sampled_row = df_traffic.sample(n=1).iloc[0]
+            decision_features = {feature: float(sampled_row[feature]) for feature in MODEL_FEATURES}
+            features_df = sampled_row[MODEL_FEATURES].to_frame().T
+            scaled_features = scaler.transform(features_df.values)
+            # Snapshot the exact model state that made this prediction, before online update.
+            decision_model_snapshot = copy.deepcopy(model)
+            prediction = model.predict(scaled_features)[0]
+            predicted_consensus = str(label_encoder.inverse_transform([int(prediction)])[0])
+            if 'consensus' in sampled_row.index:
+                true_label = str(sampled_row['consensus'])
+            network.set_consensus(predicted_consensus)
+            if true_label is not None:
+                online_update(scaled_features, true_label)
+            print(f"Dynamic consensus selected: {predicted_consensus}; active mode: {network.consensus_mode}; dataset label: {true_label}")
+            last_consensus_decision = {
+                'selected_consensus': predicted_consensus,
+                'active_consensus': network.consensus_mode,
+                'features': decision_features,
+                'model_snapshot': decision_model_snapshot,
+                'source': 'Existing dynamic consensus pipeline using a sampled row from Current_Network_Metrics.csv',
+                'true_label': true_label,
+                'transaction_id': result.get('transaction_id', result.get('id')),
+                'timestamp': time.time(),
+            }
         else:
-            print(
-                "⚠️ Current-network ML prediction was not performed: "
-                f"{prediction_info.get('message')}"
-            )
-    else:
-        print("⚠️ Consensus ML model is not ready; keeping current consensus.")
+            last_consensus_decision = None
+            print('Dynamic consensus model unavailable; existing active consensus retained.')
+    except Exception as consensus_error:
+        app.logger.exception('Existing dynamic consensus selection failed')
+        # Do not claim a new selection if the existing pipeline failed.
+        last_consensus_decision = None
 
-
-    result["predicted_consensus"] = predicted_consensus
-    result["consensus_ml"] = prediction_info
+    result['selected_consensus'] = predicted_consensus
+    result['executed_consensus'] = network.consensus_mode
 
     return jsonify({
         'success': True,
@@ -1667,35 +1471,61 @@ def add_land_tx():
     })
 
 
-@app.route('/api/predict_consensus', methods=['GET'])
-def predict_consensus_route():
-    """
-    Test the current-network ML prediction without adding a transaction.
-    This is useful for validating Module 4.
-    """
-    load_network_state()
+@app.route('/api/consensus/explanation', methods=['GET'])
+def consensus_explanation_route():
+    """Explain the actual decision made by the existing dynamic consensus pipeline."""
+    try:
+        load_network_state()
+        decision = last_consensus_decision
+        active_mode = getattr(network, 'consensus_mode', 'PoW')
+        if not decision:
+            return jsonify({
+                'module': 'Module 4 — Explainable Dynamic Consensus',
+                'error': 'No dynamic-consensus decision has been captured in this server session yet. Submit a land transaction to run the existing selector, then refresh this explanation.',
+                'selected_consensus': None,
+                'current_consensus': active_mode,
+                'lime_explanation': {'method': 'LIME not run', 'features': [], 'warning': 'No actual selection event is available to explain.'},
+                'decision_method': 'Existing dynamic consensus pipeline',
+            })
+        if not model_ready or scaler is None or label_encoder is None or df_traffic is None:
+            return jsonify({'error': 'The existing dynamic consensus model or its dataset is unavailable; cannot explain the actual selection.'}), 503
 
-    if not model_ready:
-        return jsonify({
-            'success': False,
-            'message': 'Consensus ML model is not ready.'
-        }), 503
-
-    predicted, info = network.predict_consensus_from_current_network()
-
-    if predicted is None:
-        return jsonify({
-            'success': False,
-            'message': info.get('message', 'Prediction failed.'),
-            'details': info
-        }), 400
-
-    return jsonify({
-        'success': True,
-        'predicted_consensus': predicted,
-        'details': info
-    })
-
+        # Use the exact feature row and the exact model snapshot that selected the protocol.
+        # Do not predict again using a different/random row inside the explanation endpoint.
+        snapshot = decision.get('model_snapshot') or model
+        features = dict(decision.get('features') or {})
+        required = list(MODEL_FEATURES)
+        missing = [name for name in required if name not in features]
+        if missing:
+            return jsonify({'error': f'The captured selection is missing features: {missing}'}), 500
+        expected_prediction = decision.get('selected_consensus')
+        from consensus_explainer import explain_consensus
+        result = explain_consensus(
+            risk_assessment={}, transaction={},
+            network_metrics={'input_sources': {name: decision.get('source', 'Existing dynamic selector input') for name in required}},
+            active_nodes=len(getattr(network, 'nodes', {}) or {}),
+            current_mode=active_mode,
+            model=snapshot, scaler=scaler, label_encoder=label_encoder,
+            training_frame=df_traffic, current_features=features,
+        )
+        # Preserve the actual selected label. If re-prediction does not match the captured
+        # decision, flag it rather than silently presenting a different explanation.
+        result['selected_consensus'] = expected_prediction
+        result['current_consensus'] = active_mode
+        result['selection_matches_current'] = expected_prediction == active_mode
+        result['decision_method'] = 'Existing dynamic consensus selector (FL_SGD model)' 
+        result['reason'] = f"The existing dynamic consensus selector selected {expected_prediction} for the captured input row. Module 4 explains this decision; it does not generate a new recommendation."
+        result['algorithm_explanation'] = f"Actually selected by the existing selector: {expected_prediction}. Active blockchain mode now: {active_mode}."
+        result['source_transaction'] = decision.get('transaction_id') or 'Most recent captured selection'
+        result['selection_source'] = decision.get('source')
+        result['training_label'] = decision.get('true_label')
+        result['decision_timestamp'] = decision.get('timestamp')
+        result['model_prediction_matches_captured'] = result.get('lime_explanation', {}).get('target_consensus') == expected_prediction
+        result['method_note'] = 'LIME explains the exact model snapshot and feature row captured when the existing dynamic selector made its decision. Dataset values are not live network measurements unless separately instrumented. The explanation endpoint does not select or change consensus.'
+        return jsonify(result)
+    except Exception as exc:
+        app.logger.exception('Module 4 actual-selection explanation failed')
+        return jsonify({'error': 'Unable to explain the captured dynamic-consensus decision.', 'detail': str(exc)}), 500
 
 @app.route('/api/set_consensus', methods=['POST'])
 @persist_action
@@ -2260,6 +2090,8 @@ INDEX_HTML = """
                 </div>
             </div>
 
+            <!-- Module 4 moved below the two-column workspace for readable full-width layout. -->
+
             <div class="card p-6">
                 <h2 class="text-lg font-bold mb-3 text-slate-800">Network Governance</h2>
                 <div id="governance-view" class="min-h-[100px] border-y border-slate-50 py-3">
@@ -2277,6 +2109,130 @@ INDEX_HTML = """
             </div>
         </div>
     </div>
+
+    <section id="module4-consensus" class="card p-5 md:p-7 mb-8 border-t-4 border-t-emerald-500 w-full">
+        <div class="flex flex-col md:flex-row md:items-start md:justify-between gap-3 mb-6">
+            <div>
+                <p class="text-xs uppercase tracking-widest font-bold text-emerald-700">Module 4</p>
+                <h2 class="text-2xl font-extrabold text-slate-900 mt-1">Explainable Dynamic Consensus</h2>
+                <p class="text-sm text-slate-500 mt-2 max-w-3xl">Explain why the existing dynamic-consensus mechanism selected its actual protocol. Module 4 observes that decision and does not select a different protocol.</p>
+            </div>
+            <button onclick="loadConsensusExplanation()" class="shrink-0 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-bold px-4 py-2.5">Refresh explanation</button>
+        </div>
+
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-3 mb-5">
+            <div class="rounded-xl border border-slate-200 bg-slate-50 p-4"><div class="text-xs uppercase tracking-wide font-bold text-slate-500">Dynamically selected protocol</div><div id="xai-consensus-selected" class="text-2xl font-extrabold text-emerald-700 mt-2">Analyzing…</div><div id="xai-consensus-reason" class="text-sm text-slate-700 mt-2 leading-relaxed">Loading explanation…</div></div>
+            <div class="rounded-xl border border-slate-200 p-4"><div class="text-xs uppercase tracking-wide font-bold text-slate-500">Currently selected protocol</div><div id="xai-current-consensus" class="text-2xl font-extrabold text-indigo-700 mt-2">—</div><div id="xai-current-status" class="text-sm text-slate-600 mt-2">Checking whether the captured selection matches the active protocol.</div></div>
+            <div class="rounded-xl border border-slate-200 p-4"><div class="text-xs uppercase tracking-wide font-bold text-slate-500">Transaction context</div><div class="grid grid-cols-2 gap-3 mt-3"><div><div class="text-xs text-slate-500">Fraud risk</div><div id="xai-risk" class="text-xl font-bold text-slate-900">—</div></div><div><div class="text-xs text-slate-500">Owner trust</div><div id="xai-trust" class="text-xl font-bold text-slate-900">—</div></div><div class="col-span-2"><div id="xai-network-summary" class="text-sm text-slate-600">Network metrics loading…</div><div id="xai-input-sources" class="text-xs text-slate-500 mt-2">Input provenance loading…</div></div></div></div>
+        </div>
+
+        <div class="grid grid-cols-1 xl:grid-cols-2 gap-5">
+            <div class="rounded-xl border border-slate-200 p-4 md:p-5 min-w-0">
+                <h3 class="text-lg font-bold text-slate-900">Why this protocol was recommended</h3>
+                <p class="text-sm text-slate-500 mt-1 mb-4">These inputs are passed to the trained consensus-selection model; each input shows its source.</p>
+                <div id="xai-consensus-factors" class="space-y-3"></div>
+                <div id="xai-consensus-algorithm" class="text-sm text-slate-700 bg-indigo-50 border border-indigo-100 rounded-lg p-4 mt-4 leading-relaxed"></div>
+                <div id="xai-consensus-note" class="text-xs text-slate-500 mt-3 leading-relaxed"></div>
+            </div>
+            <div class="rounded-xl border border-violet-200 bg-violet-50/40 p-4 md:p-5 min-w-0">
+                <h3 class="text-lg font-bold text-violet-950">Why the selected consensus was chosen — LIME</h3>
+                <p class="text-sm text-violet-800 mt-1">LIME locally approximates the trained consensus selector using representative project network-metrics rows.</p>
+                <div id="xai-lime-target" class="text-sm font-semibold text-slate-800 mt-4">Waiting for explanation…</div>
+                <div id="xai-lime-features" class="space-y-3 mt-3"></div>
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-4 text-xs text-slate-600"><div class="bg-white rounded-lg border border-violet-100 p-3"><strong>Positive weight</strong><p class="mt-1">Supports the selected class in the local surrogate.</p></div><div class="bg-white rounded-lg border border-violet-100 p-3"><strong>Negative weight</strong><p class="mt-1">Pushes against the selected class in the local surrogate.</p></div></div>
+                <div id="xai-lime-warning" class="text-xs text-slate-500 mt-4 leading-relaxed"></div>
+            </div>
+        </div>
+
+        <div class="mt-6">
+            <div class="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-2 mb-3"><div><h3 class="text-lg font-bold text-slate-900">Consensus protocol reference</h3><p class="text-sm text-slate-500 mt-1">Reference descriptions only. The highlighted protocol is the one selected by the existing dynamic-consensus pipeline.</p></div></div>
+            <div id="xai-algorithm-options" class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3"><div class="text-sm text-slate-500">Loading protocol comparison…</div></div>
+        </div>
+    </section>
+
+    <div class="card p-6 mb-8">
+        <div class="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4 mb-4">
+            <div>
+                <h2 class="text-lg font-bold text-slate-800">Project Transaction Graph + Blockchain Network</h2>
+                <p class="text-xs text-slate-500 mt-1">The graph uses the mixed UK HM Land Registry dataset with synthetic owner/buyer/seller details. Search a User, Land, or Transaction to explore the connected records.</p>
+            </div>
+            <div class="flex flex-wrap gap-2">
+                <input id="graph-postcode" class="p-2 text-xs rounded border border-slate-200" placeholder="Postcode filter (optional)">
+                <input id="graph-property" class="p-2 text-xs rounded border border-slate-200" placeholder="Property ID filter (optional)">
+                <button onclick="loadRealGraph({recentOnly:true})" class="bg-indigo-600 text-white px-4 py-2 rounded-lg text-xs font-bold">Show User Graph</button>
+            </div>
+        </div>
+        <div class="grid grid-cols-2 md:grid-cols-5 gap-2 mb-4 text-center text-xs">
+            <div class="bg-slate-50 rounded p-2"><b id="graph-count-nodes">0</b><br>Nodes</div>
+            <div class="bg-slate-50 rounded p-2"><b id="graph-count-edges">0</b><br>Edges</div>
+            <div class="bg-slate-50 rounded p-2"><b id="graph-count-properties">0</b><br>Properties</div>
+            <div class="bg-slate-50 rounded p-2"><b id="graph-count-transactions">0</b><br>Transactions</div>
+            <div class="bg-slate-50 rounded p-2"><b id="graph-count-blocks">0</b><br>Blocks</div>
+        </div>
+        <div class="grid grid-cols-1 xl:grid-cols-4 gap-4 items-start">
+            <div class="xl:col-span-3 space-y-4">
+                <div class="border border-slate-200 rounded-xl overflow-hidden bg-slate-950">
+                    <div id="real-graph-canvas" class="relative h-[620px] overflow-hidden">
+                        <svg id="real-graph-svg" class="w-full h-full"></svg>
+                        <div class="absolute top-3 left-3 z-10 flex flex-wrap gap-2">
+                            <button onclick="graphZoom(1.25)" class="px-3 py-1.5 rounded-lg bg-white/90 text-slate-700 text-xs font-bold shadow">＋ Zoom</button>
+                            <button onclick="graphZoom(0.8)" class="px-3 py-1.5 rounded-lg bg-white/90 text-slate-700 text-xs font-bold shadow">－ Zoom</button>
+                            <button onclick="resetGraphView()" class="px-3 py-1.5 rounded-lg bg-white/90 text-slate-700 text-xs font-bold shadow">Fit / Reset View</button>
+                        </div>
+                        <div class="absolute bottom-3 left-3 z-10 px-3 py-2 rounded-lg bg-black/50 text-slate-300 text-[10px]">Scroll = zoom • Drag empty space = pan • Click node = inspect</div>
+                        <div id="graph-empty" class="absolute inset-0 flex items-center justify-center text-slate-400 text-sm">Load the graph, then search a node to explore its connected records.</div>
+                    </div>
+                </div>
+
+                <!-- Selected-node details are deliberately below the graph.
+                     This prevents the old short right-hand card from leaving a large
+                     empty vertical area beside the 620px graph canvas. -->
+                <div id="graph-selected-node" class="hidden bg-white border border-slate-200 rounded-xl p-4 shadow-sm">
+                    <div class="flex items-center justify-between gap-3 mb-3">
+                        <h3 class="font-bold text-sm">Transaction / Node Details</h3>
+                        <span class="text-[10px] text-slate-400">Selected graph node</span>
+                    </div>
+                    <div id="graph-selected-json" class="text-xs text-slate-600"></div>
+                </div>
+            </div>
+
+            <div class="space-y-4">
+                <div class="bg-indigo-50 rounded-xl p-4 border border-indigo-100">
+                    <h3 class="font-bold text-sm mb-2 text-indigo-900">Find a Node</h3>
+                    <p class="text-[10px] text-indigo-700 mb-2">Default view is a small overview of recent dataset records to keep the graph readable. Search a User, Land, or Transaction ID to explore the full matching history.</p>
+                    <div class="flex gap-2 mb-2">
+                        <select id="graph-search-type" class="w-32 p-2 text-xs rounded border border-indigo-200">
+                            <option value="Owner" selected>User</option>
+                            <option value="Property">Land</option>
+                            <option value="Transaction">Transaction</option>
+                        </select>
+                        <input id="graph-search" class="flex-1 p-2 text-xs rounded border border-indigo-200" placeholder="e.g. Vishal" onkeydown="if(event.key==='Enter') focusGraphNode()">
+                    </div>
+                    <div class="flex gap-2 mb-2">
+                        <select id="graph-depth" class="flex-1 p-2 text-xs rounded border border-indigo-200">
+                            <option value="1" selected>Direct connections</option>
+                            <option value="2">2-hop connections</option>
+                            <option value="3">3-hop connections</option>
+                        </select>
+                        <button onclick="focusGraphNode()" class="flex-1 bg-indigo-600 text-white py-2 rounded text-xs font-bold">Find Node</button>
+                    </div>
+                    <button onclick="loadRealGraph({recentOnly:true})" class="w-full bg-white border border-indigo-200 py-2 rounded text-xs font-bold text-indigo-700">Show Recent Nodes Only</button>
+                    <div id="graph-search-status" class="text-[10px] text-slate-500 mt-2"></div>
+                </div>
+                <div class="bg-slate-50 rounded-xl p-4">
+                    <h3 class="font-bold text-sm mb-3">Add Graph Node</h3>
+                    <input id="custom-node-type" class="w-full p-2 text-xs rounded border border-slate-200 mb-2" placeholder="Type e.g. Inspection">
+                    <input id="custom-node-label" class="w-full p-2 text-xs rounded border border-slate-200 mb-2" placeholder="Label">
+                    <button onclick="addGraphNode()" class="w-full bg-white border border-slate-300 py-2 rounded text-xs font-bold">Add Node</button>
+                </div>
+                <div class="bg-slate-50 rounded-xl p-4">
+                    <h3 class="font-bold text-sm mb-2">Data rule</h3>
+                    <p class="text-[11px] text-slate-500 leading-relaxed">The graph uses real HM Land Registry Price Paid records augmented with synthetic owner/buyer/seller details. Search queries the full mixed dataset; the visible default graph is capped for browser performance.</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
 
     <div class="card p-6 mb-8">
         <h2 class="text-sm font-bold mb-4 text-slate-800 flex items-center gap-2">
@@ -3104,6 +3060,780 @@ function renderGovernance(users) {
 }
 
 // ... the rest of the existing API trigger functions remain unchanged ...
+let latestRealGraph = null;
+let graphNodes = [];
+let graphEdges = [];
+let graphAnimation = null;
+let graphScale = 1;
+let graphOffsetX = 0;
+let graphOffsetY = 0;
+let graphPan = null;
+let graphDraggingNode = null;
+let graphWorld = null;
+
+function graphColor(type) {
+    const colors = {
+        Property: '#38bdf8',
+        Transaction: '#a78bfa',
+        Owner: '#fb7185',
+        Area: '#fbbf24',
+        Postcode: '#34d399',
+        BlockchainLand: '#22c55e',
+        BlockchainTransaction: '#fb7185',
+        Block: '#f59e0b',
+        NetworkNode: '#14b8a6',
+        Custom: '#e2e8f0'
+    };
+    return colors[type] || '#94a3b8';
+}
+
+function graphNodeRadius(n) {
+    if (n.id === window.graphFocusNodeId) return 24;
+    if (n.type === 'Property' || n.type === 'BlockchainLand') return 17;
+    if (n.type === 'Owner') return 14;
+    return 11;
+}
+
+function graphLabel(n) {
+    const text = String(n.label || n.id || '');
+    return text.length > 34 ? text.slice(0, 34) + '…' : text;
+}
+
+function stopGraphAnimation() {
+    if (graphAnimation) {
+        cancelAnimationFrame(graphAnimation);
+        graphAnimation = null;
+    }
+}
+
+function updateGraphWorldTransform() {
+    if (graphWorld) {
+        graphWorld.setAttribute('transform',
+            `translate(${graphOffsetX},${graphOffsetY}) scale(${graphScale})`);
+    }
+}
+
+function graphZoom(factor) {
+    const svg = document.getElementById('real-graph-svg');
+    if (!svg) return;
+    const oldScale = graphScale;
+    graphScale = Math.max(0.25, Math.min(5, graphScale * factor));
+
+    // Zoom around the centre of the canvas instead of jumping to the top-left.
+    const rect = svg.getBoundingClientRect();
+    const cx = rect.width / 2;
+    const cy = rect.height / 2;
+    graphOffsetX = cx - (cx - graphOffsetX) * (graphScale / oldScale);
+    graphOffsetY = cy - (cy - graphOffsetY) * (graphScale / oldScale);
+    updateGraphWorldTransform();
+}
+
+function fitGraphToView(nodes = graphNodes) {
+    const svg = document.getElementById('real-graph-svg');
+    if (!svg || !graphWorld || !nodes || !nodes.length) return;
+
+    const rect = svg.getBoundingClientRect();
+    const width = rect.width || 900;
+    const height = rect.height || 620;
+    const xs = nodes.map(n => Number(n.x)).filter(Number.isFinite);
+    const ys = nodes.map(n => Number(n.y)).filter(Number.isFinite);
+    if (!xs.length || !ys.length) return;
+
+    const minX = Math.min(...xs);
+    const maxX = Math.max(...xs);
+    const minY = Math.min(...ys);
+    const maxY = Math.max(...ys);
+    const spanX = Math.max(120, maxX - minX);
+    const spanY = Math.max(120, maxY - minY);
+    const padding = 70;
+
+    // Fit the finished force layout into the visible canvas without changing
+    // the actual node positions used by the simulation.
+    const fitScale = Math.max(0.25, Math.min(1.35,
+        Math.min((width - padding * 2) / spanX, (height - padding * 2) / spanY)));
+
+    graphScale = fitScale;
+    const centerX = (minX + maxX) / 2;
+    const centerY = (minY + maxY) / 2;
+    graphOffsetX = width / 2 - centerX * graphScale;
+    graphOffsetY = height / 2 - centerY * graphScale;
+    updateGraphWorldTransform();
+}
+
+function resetGraphView() {
+    fitGraphToView(graphNodes);
+}
+
+function createGraphSvgElement(tag, attrs = {}) {
+    const el = document.createElementNS('http://www.w3.org/2000/svg', tag);
+    Object.entries(attrs).forEach(([k, v]) => el.setAttribute(k, v));
+    return el;
+}
+
+function renderGraphSubset(nodes, edges, titleText = '') {
+    const svg = document.getElementById('real-graph-svg');
+    const empty = document.getElementById('graph-empty');
+    if (!svg) return;
+
+    stopGraphAnimation();
+    svg.innerHTML = '';
+    graphWorld = null;
+
+    if (!nodes || !nodes.length) {
+        if (empty) empty.style.display = 'flex';
+        return;
+    }
+    if (empty) empty.style.display = 'none';
+
+    const rect = svg.getBoundingClientRect();
+    const width = Math.max(700, rect.width || 900);
+    const height = Math.max(500, rect.height || 620);
+    svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
+
+    graphScale = 1;
+    graphOffsetX = 0;
+    graphOffsetY = 0;
+
+    // Clone data so the original API response is never mutated.
+    graphNodes = nodes.map((n, i) => ({
+        ...n,
+        x: n.x ?? width / 2 + Math.cos(i * 2.399) * (80 + (i % 7) * 22),
+        y: n.y ?? height / 2 + Math.sin(i * 2.399) * (70 + (i % 7) * 20),
+        vx: 0,
+        vy: 0
+    }));
+    const idSet = new Set(graphNodes.map(n => n.id));
+    graphEdges = edges.filter(e => idSet.has(e.source) && idSet.has(e.target)).map(e => ({...e}));
+    const byId = new Map(graphNodes.map(n => [n.id, n]));
+    const focusId = window.graphFocusNodeId;
+
+    graphWorld = createGraphSvgElement('g', {class:'graph-world'});
+    svg.appendChild(graphWorld);
+
+    const edgeLayer = createGraphSvgElement('g', {class:'graph-edges'});
+    const nodeLayer = createGraphSvgElement('g', {class:'graph-nodes'});
+    graphWorld.appendChild(edgeLayer);
+    graphWorld.appendChild(nodeLayer);
+
+    // Draw edges first so nodes always sit above them.
+    graphEdges.forEach(e => {
+        const line = createGraphSvgElement('line', {
+            stroke: (e.source === focusId || e.target === focusId) ? '#cbd5e1' : '#64748b',
+            'stroke-width': (e.source === focusId || e.target === focusId) ? '2.8' : '1.1',
+            'stroke-opacity': (e.source === focusId || e.target === focusId) ? '0.9' : '0.38'
+        });
+        edgeLayer.appendChild(line);
+        e.__el = line;
+    });
+
+    graphNodes.forEach(n => {
+        const g = createGraphSvgElement('g', {'data-node-id': n.id});
+        g.style.cursor = 'grab';
+
+        const circle = createGraphSvgElement('circle', {
+            r: graphNodeRadius(n),
+            fill: graphColor(n.type),
+            stroke: n.id === focusId ? '#ffffff' : '#020617',
+            'stroke-width': n.id === focusId ? '4' : '2'
+        });
+        g.appendChild(circle);
+
+        // Only show labels for the focused node. Other labels appear on hover.
+        const text = createGraphSvgElement('text', {
+            x: '0',
+            y: String(graphNodeRadius(n) + 17),
+            'text-anchor': 'middle',
+            fill: '#f8fafc',
+            'font-size': n.id === focusId ? '14' : '11',
+            'font-weight': n.id === focusId ? '800' : '600',
+            'paint-order': 'stroke',
+            stroke: '#020617',
+            'stroke-width': '3',
+            visibility: n.id === focusId ? 'visible' : 'hidden'
+        });
+        text.textContent = graphLabel(n);
+        g.appendChild(text);
+
+        const badge = createGraphSvgElement('text', {
+            x: '0', y: '4', 'text-anchor': 'middle',
+            fill: '#020617', 'font-size': '8', 'font-weight': '800',
+            'pointer-events': 'none'
+        });
+        const initials = String(n.type || '?').slice(0, 1).toUpperCase();
+        badge.textContent = initials;
+        g.appendChild(badge);
+
+        g.addEventListener('mouseenter', () => {
+            circle.setAttribute('stroke', '#ffffff');
+            circle.setAttribute('stroke-width', '3.5');
+            text.setAttribute('visibility', 'visible');
+            document.getElementById('graph-search-status').textContent =
+                `${n.type}: ${n.label || n.id}`;
+        });
+        g.addEventListener('mouseleave', () => {
+            circle.setAttribute('stroke', n.id === window.graphFocusNodeId ? '#ffffff' : '#020617');
+            circle.setAttribute('stroke-width', n.id === window.graphFocusNodeId ? '4' : '2');
+            if (n.id !== window.graphFocusNodeId) text.setAttribute('visibility', 'hidden');
+        });
+        g.addEventListener('click', (event) => {
+            event.stopPropagation();
+            selectAndFocusGraphNode(n.id);
+        });
+
+        // Native SVG pointer dragging — no D3 dependency required.
+        g.addEventListener('pointerdown', (event) => {
+            event.stopPropagation();
+            graphDraggingNode = {
+                node: n,
+                startX: event.clientX,
+                startY: event.clientY,
+                nodeX: n.x,
+                nodeY: n.y
+            };
+            g.setPointerCapture(event.pointerId);
+            g.style.cursor = 'grabbing';
+        });
+        g.addEventListener('pointermove', (event) => {
+            if (!graphDraggingNode || graphDraggingNode.node !== n) return;
+            const dx = (event.clientX - graphDraggingNode.startX) / graphScale;
+            const dy = (event.clientY - graphDraggingNode.startY) / graphScale;
+            n.x = graphDraggingNode.nodeX + dx;
+            n.y = graphDraggingNode.nodeY + dy;
+            n.vx = 0; n.vy = 0;
+        });
+        g.addEventListener('pointerup', () => {
+            graphDraggingNode = null;
+            g.style.cursor = 'grab';
+        });
+
+        nodeLayer.appendChild(g);
+        n.__el = g;
+        n.__circle = circle;
+        n.__text = text;
+    });
+
+    svg.addEventListener('click', clearGraphSelection, {once:true});
+    installGraphCanvasControls();
+
+    // Lightweight force simulation. This gives the "floating nodes" look without
+    // requiring an external JavaScript library.
+    const centerX = width / 2;
+    const centerY = height / 2;
+    const iterations = 180;
+    let tick = 0;
+
+    function step() {
+        if (!graphNodes.length) return;
+        tick++;
+
+        // Repulsion.
+        for (let i = 0; i < graphNodes.length; i++) {
+            const a = graphNodes[i];
+            for (let j = i + 1; j < graphNodes.length; j++) {
+                const b = graphNodes[j];
+                let dx = b.x - a.x;
+                let dy = b.y - a.y;
+                let dist2 = dx * dx + dy * dy;
+                if (dist2 < 25) dist2 = 25;
+                const dist = Math.sqrt(dist2);
+                const force = Math.min(1800 / dist2, 0.8);
+                const fx = (dx / dist) * force;
+                const fy = (dy / dist) * force;
+                a.vx -= fx; a.vy -= fy;
+                b.vx += fx; b.vy += fy;
+            }
+        }
+
+        // Spring forces along real graph edges.
+        graphEdges.forEach(e => {
+            const a = byId.get(e.source);
+            const b = byId.get(e.target);
+            if (!a || !b) return;
+            let dx = b.x - a.x;
+            let dy = b.y - a.y;
+            const dist = Math.max(1, Math.sqrt(dx*dx + dy*dy));
+            const desired = focusId ? 125 : 105;
+            const force = (dist - desired) * 0.0035;
+            const fx = (dx / dist) * force;
+            const fy = (dy / dist) * force;
+            a.vx += fx; a.vy += fy;
+            b.vx -= fx; b.vy -= fy;
+        });
+
+        // Gentle pull to centre + damping.
+        graphNodes.forEach(n => {
+            n.vx += (centerX - n.x) * 0.0009;
+            n.vy += (centerY - n.y) * 0.0009;
+            n.vx *= 0.82;
+            n.vy *= 0.82;
+            if (!graphDraggingNode || graphDraggingNode.node !== n) {
+                n.x += n.vx;
+                n.y += n.vy;
+            }
+            const pad = 35;
+            n.x = Math.max(pad, Math.min(width-pad, n.x));
+            n.y = Math.max(pad, Math.min(height-pad, n.y));
+        });
+
+        graphEdges.forEach(e => {
+            const a = byId.get(e.source), b = byId.get(e.target);
+            if (a && b && e.__el) {
+                e.__el.setAttribute('x1', a.x);
+                e.__el.setAttribute('y1', a.y);
+                e.__el.setAttribute('x2', b.x);
+                e.__el.setAttribute('y2', b.y);
+            }
+        });
+        graphNodes.forEach(n => {
+            if (n.__el) n.__el.setAttribute('transform', `translate(${n.x},${n.y})`);
+        });
+
+        if (tick < iterations || graphDraggingNode) {
+            graphAnimation = requestAnimationFrame(step);
+        } else {
+            graphAnimation = null;
+            // Automatically centre and scale the completed layout so the graph
+            // does not sit in a small corner of the canvas.
+            fitGraphToView(graphNodes);
+        }
+    }
+    step();
+
+    document.getElementById('graph-search-status').textContent =
+        titleText || `${nodes.length} floating nodes shown. Drag nodes, pan the canvas or scroll to zoom.`;
+}
+
+function installGraphCanvasControls() {
+    const svg = document.getElementById('real-graph-svg');
+    if (!svg || svg.dataset.controlsInstalled === '1') return;
+    svg.dataset.controlsInstalled = '1';
+
+    svg.style.cursor = 'grab';
+    svg.addEventListener('wheel', (event) => {
+        event.preventDefault();
+        graphZoom(event.deltaY < 0 ? 1.12 : 0.89);
+    }, {passive:false});
+
+    svg.addEventListener('pointerdown', (event) => {
+        if (event.target.closest('[data-node-id]')) return;
+        graphPan = {x:event.clientX, y:event.clientY, ox:graphOffsetX, oy:graphOffsetY};
+        svg.style.cursor = 'grabbing';
+        svg.setPointerCapture(event.pointerId);
+    });
+    svg.addEventListener('pointermove', (event) => {
+        if (!graphPan) return;
+        graphOffsetX = graphPan.ox + (event.clientX - graphPan.x);
+        graphOffsetY = graphPan.oy + (event.clientY - graphPan.y);
+        updateGraphWorldTransform();
+    });
+    svg.addEventListener('pointerup', () => {
+        graphPan = null;
+        svg.style.cursor = 'grab';
+    });
+    svg.addEventListener('pointercancel', () => {
+        graphPan = null;
+        svg.style.cursor = 'grab';
+    });
+}
+
+function clearGraphSelection() {
+    const status = document.getElementById('graph-search-status');
+    if (status) status.textContent = 'Search a node to explore its connected neighbourhood.';
+}
+
+function selectAndFocusGraphNode(nodeId) {
+    if (!latestRealGraph) return;
+    const depth = parseInt(document.getElementById('graph-depth').value || '2', 10);
+    renderConnectedNode(nodeId, depth);
+}
+
+function renderRealGraph(graph) {
+    latestRealGraph = graph;
+
+    // The backend returns counts by exact node type (Owner, Property,
+    // Transaction, BlockchainTransaction, Block, etc.).  The old UI only
+    // looked for the exact strings Property/Transaction, so the cards could
+    // incorrectly show 0 even when those nodes were present. Count from the
+    // actual returned nodes so the dashboard always matches the graph.
+    const nodes = Array.isArray(graph.nodes) ? graph.nodes : [];
+    const countByType = {};
+    nodes.forEach(n => {
+        const type = String(n?.type || 'Custom');
+        countByType[type] = (countByType[type] || 0) + 1;
+    });
+
+    const propertyCount = nodes.filter(n => {
+        const type = String(n?.type || '').toLowerCase();
+        return type === 'property' || type === 'blockchainland' || type.includes('land');
+    }).length;
+
+    const transactionCount = nodes.filter(n => {
+        const type = String(n?.type || '').toLowerCase();
+        return type.includes('transaction') || type === 'datasettransaction';
+    }).length;
+
+    const blockCount = nodes.filter(n => String(n?.type || '').toLowerCase() === 'block').length;
+
+    document.getElementById('graph-count-nodes').textContent = nodes.length;
+    document.getElementById('graph-count-edges').textContent = Array.isArray(graph.edges) ? graph.edges.length : 0;
+    document.getElementById('graph-count-properties').textContent = propertyCount;
+    document.getElementById('graph-count-transactions').textContent = transactionCount;
+    document.getElementById('graph-count-blocks').textContent = blockCount;
+    window.graphFocusNodeId = null;
+    showGraphOverview();
+}
+
+function showGraphOverview() {
+    if (!latestRealGraph || !latestRealGraph.nodes) return;
+
+    // // Default view shows the mixed UK HM Land Registry + synthetic-owner dataset.
+    // The initial payload is intentionally tiny so the graph stays readable; searches
+    // can still open the matching history and include live blockchain records.
+    const nodes = latestRealGraph.nodes;
+    const ids = new Set(nodes.map(n => n.id));
+    const edges = latestRealGraph.edges.filter(e => ids.has(e.source) && ids.has(e.target));
+    renderGraphSubset(nodes, edges,
+        `Readable overview: ${nodes.length} nodes from a small sample of recent dataset transactions. Search a User, Land, or Transaction to inspect related records.`);
+}
+
+function escapeHtml(value) {
+    return String(value ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
+}
+
+function formatGraphDate(node) {
+    if (node?.transaction_date) return String(node.transaction_date);
+    if (node?.date) return String(node.date);
+    if (node?.timestamp) {
+        const d = new Date(Number(node.timestamp) * 1000);
+        if (!Number.isNaN(d.getTime())) return d.toLocaleDateString();
+    }
+    return 'Not available';
+}
+
+function renderGraphNodeDetails(found, allNodes, allEdges) {
+    const box = document.getElementById('graph-selected-json');
+    if (!box) return;
+
+    const type = String(found.type || '').toLowerCase();
+    const isTransaction = type.includes('transaction');
+    const isProperty = type === 'property' || type === 'blockchainland';
+
+    if (isTransaction) {
+        const seller = found.old_owner || found.seller || 'Not available';
+        const buyer = found.new_owner || found.buyer || 'Not available';
+        const land = found.land_id || 'Not available';
+        const year = found.year ?? 'Not available';
+        const date = formatGraphDate(found);
+        const price = Number(found.price ?? found.land_price ?? 0);
+        const txid = found.transaction_id || (found.id || '').replace(/^DatasetTx::|^BlockchainTx::/, '');
+        const label = found.label_name || (found.dataset_label === 1 ? 'Fraud / Duplicate' : 'Legitimate');
+
+        box.innerHTML = `
+            <div class="space-y-3">
+                <div class="p-3 rounded-lg bg-indigo-50 border border-indigo-100">
+                    <div class="font-bold text-indigo-900">
+                        ${escapeHtml(seller)} <span class="text-indigo-500">→</span> ${escapeHtml(buyer)}
+                    </div>
+                    <div class="text-xs text-indigo-700 mt-1">
+                        ${escapeHtml(seller)} transferred the land to ${escapeHtml(buyer)}
+                        in <b>${escapeHtml(year)}</b>.
+                    </div>
+                </div>
+
+                <div class="grid grid-cols-2 gap-2">
+                    <div><span class="text-[9px] uppercase font-bold text-slate-400">Transaction ID</span>
+                        <div class="font-mono text-[10px] break-all">${escapeHtml(txid)}</div></div>
+                    <div><span class="text-[9px] uppercase font-bold text-slate-400">Transfer Date</span>
+                        <div>${escapeHtml(date)}</div></div>
+                    <div><span class="text-[9px] uppercase font-bold text-slate-400">Land ID</span>
+                        <div class="break-words">${escapeHtml(land)}</div></div>
+                    <div><span class="text-[9px] uppercase font-bold text-slate-400">Price</span>
+                        <div>₹${price.toLocaleString('en-IN')}</div></div>
+                    <div><span class="text-[9px] uppercase font-bold text-slate-400">Status</span>
+                        <div class="font-semibold">${escapeHtml(label)}</div></div>
+                    <div><span class="text-[9px] uppercase font-bold text-slate-400">Source</span>
+                        <div>${escapeHtml(found.source || '—')}</div></div>
+                </div>
+
+                ${found.document_hash ? `
+                <div>
+                    <span class="text-[9px] uppercase font-bold text-slate-400">Document Hash</span>
+                    <div class="font-mono text-[10px] break-all">${escapeHtml(found.document_hash)}</div>
+                </div>` : ''}
+            </div>
+        `;
+        return;
+    }
+    // For an owner or land/property node, show the node plus the connected
+    // transaction history so the ownership chain is immediately visible.
+    const connectedIds = new Set();
+    allEdges.forEach(e => {
+        if (e.source === found.id) connectedIds.add(e.target);
+        if (e.target === found.id) connectedIds.add(e.source);
+    });
+
+    const transactions = allNodes
+        .filter(n => connectedIds.has(n.id) && String(n.type || '').toLowerCase().includes('transaction'))
+        .sort((a, b) => Number(a.timestamp || 0) - Number(b.timestamp || 0));
+
+    const historyHtml = transactions.length
+        ? transactions.map(tx => {
+            const seller = tx.old_owner || tx.seller || 'Unknown';
+            const buyer = tx.new_owner || tx.buyer || 'Unknown';
+            const year = tx.year ?? '—';
+            return `<div class="py-2 border-b border-slate-100">
+                <div class="font-semibold text-[11px]">${escapeHtml(seller)} → ${escapeHtml(buyer)}</div>
+                <div class="text-[10px] text-slate-500">
+                    ${escapeHtml(tx.land_id || '')} • ${escapeHtml(year)} •
+                    ₹${Number(tx.price || 0).toLocaleString('en-IN')}
+                </div>
+            </div>`;
+        }).join('')
+        : '<div class="text-[10px] text-slate-400">No connected transaction history found.</div>';
+
+    box.innerHTML = `
+        <div class="space-y-3">
+            <div><span class="text-[9px] uppercase font-bold text-slate-400">Type</span>
+                <div class="font-semibold">${escapeHtml(found.type || 'Node')}</div></div>
+            <div><span class="text-[9px] uppercase font-bold text-slate-400">Name</span>
+                <div>${escapeHtml(found.label || found.id)}</div></div>
+            ${found.land_id ? `<div><span class="text-[9px] uppercase font-bold text-slate-400">Land ID</span>
+                <div class="break-words">${escapeHtml(found.land_id)}</div></div>` : ''}
+            <div>
+                <span class="text-[9px] uppercase font-bold text-slate-400">Transaction History</span>
+                <div class="mt-1">${historyHtml}</div>
+            </div>
+        </div>
+    `;
+}
+
+function renderConnectedNode(nodeId, depth = 2) {
+    if (!latestRealGraph) return;
+    const allNodes = latestRealGraph.nodes;
+    const allEdges = latestRealGraph.edges;
+    const ids = new Set([nodeId]);
+    let frontier = [nodeId];
+    for (let d = 0; d < depth; d++) {
+        const next = [];
+        const current = new Set(frontier);
+        allEdges.forEach(e => {
+            if (current.has(e.source) && !ids.has(e.target)) {
+                ids.add(e.target); next.push(e.target);
+            }
+            if (current.has(e.target) && !ids.has(e.source)) {
+                ids.add(e.source); next.push(e.source);
+            }
+        });
+        frontier = next;
+        if (!frontier.length) break;
+    }
+
+    const maxNodes = 80;
+    let selectedIds = [...ids];
+    if (selectedIds.length > maxNodes) {
+        const direct = allEdges.filter(e => e.source === nodeId || e.target === nodeId);
+        selectedIds = [...new Set([nodeId, ...direct.flatMap(e => [e.source, e.target])])].slice(0, maxNodes);
+    }
+
+    const selectedSet = new Set(selectedIds);
+    const nodes = allNodes.filter(n => selectedSet.has(n.id));
+    const edges = allEdges.filter(e => selectedSet.has(e.source) && selectedSet.has(e.target));
+    const found = allNodes.find(n => n.id === nodeId);
+    if (!found) return;
+
+    window.graphFocusNodeId = nodeId;
+    document.getElementById('graph-search').value = found.label || found.id;
+    document.getElementById('graph-selected-node').classList.remove('hidden');
+    renderGraphNodeDetails(found, allNodes, allEdges);
+
+    renderGraphSubset(nodes, edges,
+        `Focused on “${found.label || found.id}” • ${nodes.length} nodes • ${edges.length} edges • ${depth}-hop neighbourhood`);
+}
+async function focusGraphNode() {
+    const query = document.getElementById('graph-search').value.trim();
+    const status = document.getElementById('graph-search-status');
+    const type = document.getElementById('graph-search-type').value;
+    if (!query) {
+        status.textContent = 'Enter a user name, land ID, or transaction ID.';
+        return;
+    }
+    status.textContent = `Searching the full project transaction dataset for ${query}...`;
+    await loadRealGraph({focusType:type, focusLabel:query, recentOnly:false});
+}
+
+async function loadRealGraph(options = {}) {
+    const adminOnly = options.adminOnly === true;
+    const recentOnly = options.recentOnly === true && !options.focusLabel && !adminOnly;
+    const params = new URLSearchParams({
+        limit: recentOnly ? '4' : (options.focusLabel ? '250' : '4'),
+        // Keep the default overview focused on the dataset. Blockchain records
+        // are included when a user searches, so the first render stays readable.
+        include_blockchain: options.focusLabel || options.includeBlockchain ? '1' : '0',
+        recent_only: recentOnly ? '1' : '0',
+        admin_only: adminOnly ? '1' : '0'
+    });
+    const postcode = document.getElementById('graph-postcode').value.trim();
+    const property = document.getElementById('graph-property').value.trim();
+    if (postcode) params.set('postcode', postcode);
+    if (property) params.set('property_id', property);
+    if (options.focusType) params.set('focus_type', options.focusType);
+    if (options.focusLabel) params.set('focus_label', options.focusLabel);
+
+    try {
+        const r = await fetch('/api/graph/real?' + params.toString());
+        const j = await r.json();
+        if (!j.success) {
+            showMessage('Graph Error', j.message, true);
+            return;
+        }
+        renderRealGraph(j);
+        if (options.focusLabel) {
+            const wantedType = String(options.focusType || '').toLowerCase();
+            const target = (options.preferCustom ? j.nodes.find(n => String(n.source || '').toLowerCase() === 'user-added' && String(n.label || '').toLowerCase() === String(options.focusLabel).toLowerCase()) : null) || j.nodes.find(n => {
+                const type = String(n.type || '').toLowerCase();
+                const label = String(n.label || '').toLowerCase();
+                const wanted = String(options.focusLabel).toLowerCase();
+                const nodeId = String(n.id || '').toLowerCase();
+                const transactionId = String(n.transaction_id || '').toLowerCase();
+                const landId = String(n.land_id || '').toLowerCase();
+
+                return (wantedType === 'owner' && type === 'owner' && (label === wanted || nodeId === `owner::${wanted}`)) ||
+                       (wantedType === 'property' && (type === 'property' || type === 'blockchainland') &&
+                           (label === wanted || landId === wanted || nodeId === `property::${wanted}` || nodeId === `blockchainland::${wanted}`)) ||
+                       (wantedType === 'transaction' && type.includes('transaction') &&
+                           (label === wanted ||
+                            transactionId === wanted ||
+                            nodeId === wanted ||
+                            nodeId.endsWith(`::${wanted}`) ||
+                            transactionId.endsWith(wanted) ||
+                            label.endsWith(wanted)));
+            });
+            if (target) {
+                const depth = parseInt(document.getElementById('graph-depth').value || '1', 10);
+                renderConnectedNode(target.id, depth);
+            }
+            document.getElementById('graph-search-status').textContent = target
+                ? `Showing ${options.focusType === 'Owner' ? 'User' : options.focusType} ${options.focusLabel} and its related transactions.`
+                : `No ${options.focusType || 'node'} named ${options.focusLabel} was found in the project transaction dataset.`;
+        } else if (adminOnly) {
+            document.getElementById('graph-search-status').textContent = 'Network/admin graph. Use only when you want to inspect blockchain network nodes.';
+        } else {
+            showMessage('Graph Updated', recentOnly
+                ? 'Showing only recently added blockchain/custom nodes.'
+                : 'Showing a compact source graph. Search a User, Land, or Transaction for detailed connections.');
+        }
+    } catch (err) {
+        document.getElementById('graph-search-status').textContent = 'Graph loading failed: ' + err.message;
+    }
+}
+
+async function addGraphNode() {
+    const type = document.getElementById('custom-node-type').value.trim() || 'Custom';
+    const label = document.getElementById('custom-node-label').value.trim();
+    if (!label) {
+        showMessage('Graph Error', 'Enter a node label.', true);
+        return;
+    }
+    const r = await fetch('/api/graph/add_node', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({type, label})
+    });
+    const j = await r.json();
+    showMessage(j.success ? 'Graph Node Added' : 'Graph Error', j.message, !j.success);
+    if (j.success) {
+        // Immediately switch to the new node's neighbourhood. The backend
+        // resolves every matching historical transaction for Owner/Land/Transaction.
+        await loadRealGraph({focusType:type, focusLabel:label, recentOnly:false, preferCustom:true});
+        if (j.node) {
+            window.graphFocusNodeId = j.node.id;
+        }
+    }
+}
+
+async function loadConsensusExplanation() {
+    const selectedEl = document.getElementById('xai-consensus-selected');
+    if (!selectedEl) return;
+    try {
+        const response = await fetch('/api/consensus/explanation', {headers: {'Accept': 'application/json'}});
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || data.error || 'Request failed');
+        if (data.error && !data.selected_consensus) {
+            selectedEl.textContent = 'Model not ready';
+            document.getElementById('xai-consensus-reason').textContent = data.error;
+            document.getElementById('xai-lime-target').textContent = 'LIME not run — no captured dynamic-consensus selection.';
+            document.getElementById('xai-lime-features').innerHTML = '';
+            document.getElementById('xai-consensus-note').textContent = 'Submit a transaction to trigger the existing dynamic-consensus selector, then refresh.';
+            return;
+        }
+        selectedEl.textContent = data.selected_consensus || '—';
+        document.getElementById('xai-consensus-reason').textContent = data.reason || 'No reason available.';
+        document.getElementById('xai-current-consensus').textContent = data.current_consensus || '—';
+        document.getElementById('xai-current-status').textContent = data.selection_matches_current
+            ? 'The captured selection matches the active consensus mode.'
+            : `The captured selection and active protocol differ; check whether another authorized action changed the active mode.`;
+        document.getElementById('xai-risk').textContent = `${Number(data.risk_score || 0).toFixed(1)}%`;
+        document.getElementById('xai-trust').textContent = `${Number(data.trust_score || 0).toFixed(1)}/100`;
+        const net = data.network || {};
+        document.getElementById('xai-network-summary').textContent = `${net.active_nodes ?? '—'} application nodes · latency ${net.latency_ms ?? 'Unavailable'} ms · throughput ${net.throughput_tps ?? 'Unavailable'} TPS`;
+        const sourceMap = data.input_sources || {};
+        document.getElementById('xai-input-sources').textContent = 'Input sources: ' + Object.entries(sourceMap).map(([k, v]) => `${k}: ${v}`).join(' | ');
+        const factors = Array.isArray(data.factors) ? data.factors : [];
+        document.getElementById('xai-consensus-factors').innerHTML = factors.map(item => `
+            <div class="rounded-lg border border-slate-200 bg-white p-3">
+                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-1"><strong class="text-sm text-slate-800">${escapeConsensusText(item.factor)}</strong><span class="text-sm font-bold text-slate-900">${escapeConsensusText(item.value)}</span></div>
+                <p class="text-sm text-slate-600 mt-1.5 leading-relaxed">${escapeConsensusText(item.effect)}</p>
+            </div>`).join('') || '<div class="text-sm text-slate-500">No decision factors available.</div>';
+        document.getElementById('xai-consensus-algorithm').textContent = data.algorithm_explanation || '';
+        document.getElementById('xai-consensus-note').textContent = data.method_note || '';
+        const lime = data.lime_explanation || {};
+        document.getElementById('xai-lime-target').textContent = `${lime.method || 'LIME'} · Explained class: ${lime.target_consensus || data.selected_consensus || '—'}`;
+        const limeFeatures = Array.isArray(lime.features) ? lime.features : [];
+        const maxWeight = Math.max(0.0001, ...limeFeatures.map(item => Math.abs(Number(item.weight || 0))));
+        document.getElementById('xai-lime-features').innerHTML = limeFeatures.map(item => {
+            const weight = Number(item.weight || 0);
+            const width = Math.max(2, Math.min(100, Math.abs(weight) / maxWeight * 100));
+            const supports = weight >= 0;
+            return `<div class="rounded-lg border border-violet-100 bg-white p-3">
+                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-1"><strong class="text-sm text-slate-800">${escapeConsensusText(item.feature)}</strong><span class="text-sm font-bold ${supports ? 'text-emerald-700' : 'text-rose-700'}">${weight > 0 ? '+' : ''}${weight.toFixed(4)}</span></div>
+                <div class="h-2 bg-slate-100 rounded-full mt-2 overflow-hidden"><div class="h-full rounded-full ${supports ? 'bg-emerald-500' : 'bg-rose-500'}" style="width:${width}%"></div></div>
+                <div class="text-xs text-slate-500 mt-1.5">${escapeConsensusText(item.direction || (supports ? 'Supports selected class locally' : 'Opposes selected class locally'))}</div>
+            </div>`;
+        }).join('') || '<div class="text-sm text-slate-500 bg-white rounded-lg p-3">LIME explanation unavailable. Check the Flask terminal for the underlying error.</div>';
+        document.getElementById('xai-lime-warning').textContent = lime.warning || lime.scope || '';
+        const options = data.algorithm_options || {};
+        const descriptions = {
+          'PoW': ['Proof of Work', 'Nodes compete through computational work. Strong historical use in public chains, but high energy and slower finality can be drawbacks.'],
+          'PoS': ['Proof of Stake', 'Validators are selected based on stake and protocol rules. Usually more energy-efficient than PoW; requires secure staking and slashing/governance design.'],
+          'PBFT': ['Practical Byzantine Fault Tolerance', 'Known validators exchange messages/votes and tolerate some Byzantine faults. Fast finality in small permissioned groups, but communication overhead grows with validator count.'],
+          'Raft': ['Raft', 'Leader-based crash-fault-tolerant consensus. Simple and efficient for trusted nodes, but it is not designed to tolerate malicious Byzantine validators.'],
+          'HotStuff': ['HotStuff', 'Quorum-based Byzantine-fault-tolerant protocol with chained phases. Designed for scalable BFT-style consensus, but implementation and validator assumptions matter.']
+        };
+        const actualSelection = data.selected_consensus;
+        document.getElementById('xai-algorithm-options').innerHTML = (data.algorithms || Object.keys(descriptions)).map(name => {
+          const info = descriptions[name] || [name, 'Protocol details are not available.'];
+          const chosen = name === actualSelection;
+          const policyReason = options[name] || (chosen ? data.reason : 'This protocol was not selected in the captured decision.');
+          return `<article class="rounded-xl border ${chosen ? 'border-emerald-300 bg-emerald-50/60' : 'border-slate-200 bg-white'} p-4">
+            <div class="flex items-start justify-between gap-2"><div><h4 class="font-bold text-slate-900">${escapeConsensusText(name)}</h4><p class="text-xs text-slate-500 mt-0.5">${escapeConsensusText(info[0])}</p></div>${chosen ? '<span class="shrink-0 rounded-full bg-emerald-100 text-emerald-800 text-[10px] font-bold px-2 py-1">Actually selected</span>' : ''}</div>
+            <p class="text-sm text-slate-600 leading-relaxed mt-3">${escapeConsensusText(info[1])}</p>
+            <div class="mt-3 border-t border-slate-100 pt-3"><div class="text-[10px] uppercase tracking-wide font-bold text-slate-500">Role in this decision</div><p class="text-sm text-slate-700 mt-1 leading-relaxed">${escapeConsensusText(policyReason)}</p></div>
+          </article>`;
+        }).join('');
+    } catch (error) {
+        selectedEl.textContent = 'Explanation unavailable';
+        document.getElementById('xai-consensus-reason').textContent = error.message;
+    }
+}
+function escapeConsensusText(value) {
+    return String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+}
+
 async function refresh() {
     try {
         const r = await fetch('/api/state');
@@ -3130,6 +3860,7 @@ async function refresh() {
         renderPendingTx(currentState.pending_transactions);
         renderBlockedTx(currentState.blocked_transactions || []);
         renderGovernance(currentUsers);
+        loadConsensusExplanation();
     } catch (e) { console.error("Refresh failed", e); }
 }
 
@@ -3161,18 +3892,46 @@ async function addLandTx() {
     const newOwner = document.getElementById('new-owner').value;
     const landPrice = document.getElementById('land-price').value;
     const pdf = document.getElementById('land-pdf').files[0];
+
     if (!landId || !newOwner || !landPrice || !pdf) {
         showMessage("Validation Error", "All fields and PDF are required", true);
         return;
     }
+
     const formData = new FormData();
     formData.append("land_id", landId);
     formData.append("new_owner", newOwner);
     formData.append("land_price", landPrice);
     formData.append("pdf", pdf);
+
     const r = await fetch('/api/add_land_tx', { method: 'POST', body: formData });
     const j = await r.json();
-    showMessage(j.success ? "Transaction Queued" : "Error", j.message, !j.success);
+
+    showMessage(
+        j.success ? "Transaction Queued" : (j.blocked ? "AI Blocked Transaction" : "Error"),
+        j.message,
+        !j.success
+    );
+
+    // Keep Srija's original GNN + SHAP + blocking workflow untouched.
+    // Only add graph visualisation/search as an additional view.
+    if (j.transaction && (j.success || j.blocked)) {
+        await refresh();
+
+        const txKey = j.transaction.id || j.transaction.transaction_id || j.transaction.land_id;
+        const txType = (j.transaction.id || j.transaction.transaction_id) ? 'Transaction' : 'Property';
+        await loadRealGraph({
+            focusType: txType,
+            focusLabel: txKey,
+            recentOnly: false
+        });
+
+        document.getElementById('graph-search-status').textContent = j.blocked
+            ? `Showing the blocked transaction: ${j.transaction.old_owner || currentState.current_user} → ${j.transaction.new_owner || newOwner}.`
+            : `Showing the new transfer: ${j.transaction.old_owner || currentState.current_user} → ${j.transaction.new_owner || newOwner}.`;
+        return;
+    }
+
     refresh();
 }
 
@@ -3187,6 +3946,7 @@ async function triggerConsensus() {
     const j = await r.json();
     showMessage(j.success ? 'Block Forged' : 'Forging Failed', j.result, !j.success);
     refresh();
+    loadRealGraph({recentOnly:false});
 }
 
 async function resolve() {
@@ -3194,6 +3954,7 @@ async function resolve() {
     const j = await r.json();
     showMessage('Network Sync', j.message);
     refresh();
+    loadRealGraph({recentOnly:false});
 }
 
 async function voteUser(username) {
@@ -3219,6 +3980,9 @@ document.getElementById('consensus').addEventListener('change', async function()
 });
 
 refresh();
+// Load the user-facing mixed dataset graph immediately.
+// Admin/network nodes are available only through the dedicated admin API mode.
+loadRealGraph({recentOnly:true});
 setInterval(refresh, 4000);
 </script>
 
@@ -3230,7 +3994,6 @@ if __name__ == '__main__':
     node_names = ['Node-B', 'Node-C']
     for name in node_names:
         network.add_node(name, stake=200 + random.randint(0, 100))
-
     print("\n--- ConcordiaChain Simulator ---")
     print(f"Credentials loaded from: {CREDENTIALS_FILE}")
     print(f"Total Users: {len(USERS)}")
