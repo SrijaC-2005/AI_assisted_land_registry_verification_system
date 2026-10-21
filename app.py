@@ -3,12 +3,18 @@ import time, json, hashlib, random, copy
 from datetime import datetime
 from risk_assessment.predict import assess_transaction
 from risk_assessment.model import LandFraudGNN
-from consensus_explainer import explain_consensus
+from consensus_explainer import (
+    explain_consensus,
+    predict_consensus,
+    check_training_range,
+    load_training_ranges,
+)
+from network_metrics import runtime_metrics
+from owner_trust import verify_title, compute_owner_trust
+from consensus_policy import fault_tolerance_requirement as policy_fault_tolerance, ineligibility_reason
 from typing import List, Dict, Any
 import os, uuid, itertools
 import csv
-from numpy import block
-from numpy import block
 from werkzeug.security import generate_password_hash, check_password_hash
 import hashlib
 import base64
@@ -39,6 +45,20 @@ CONSENSUS_SELECTOR_DIR = os.path.join(BASE_DIR, "FL_SGD", "consensus_selector")
 CONSENSUS_SELECTOR_MODEL_PATH = os.path.join(CONSENSUS_SELECTOR_DIR, "model.pkl")
 CONSENSUS_SELECTOR_SCALER_PATH = os.path.join(CONSENSUS_SELECTOR_DIR, "scaler.pkl")
 CONSENSUS_SELECTOR_ENCODER_PATH = os.path.join(CONSENSUS_SELECTOR_DIR, "label_encoder.pkl")
+CONSENSUS_SELECTOR_EVAL_PATH = os.path.join(CONSENSUS_SELECTOR_DIR, "evaluation.json")
+CONSENSUS_SELECTOR_BACKGROUND_PATH = os.path.join(CONSENSUS_SELECTOR_DIR, "lime_background.csv")
+# The selector now uses only runtime-relevant features. Energy and vehicle-count
+# columns are excluded because this prototype cannot measure them for land-registry nodes.
+CONSENSUS_FEATURES = [
+    "node_count",
+    "network_latency_ms",
+    "tx_throughput_tps",
+    "security_risk_score",
+    "fault_tolerance_requirement",
+]
+# Fault-tolerance requirement is now set per transaction by consensus_policy.py
+# (value tier + risk tier). Kept only as a fallback.
+FAULT_TOLERANCE_REQUIREMENT = float(os.environ.get("LAND_REGISTRY_FAULT_TOLERANCE_REQUIREMENT", "0.75"))
 
 NETWORK_STATE_FILE = os.path.join(BASE_DIR, "Blockchain_Ledger.json") # New file for state persistence
 USERS: Dict[str, str] = {} # {username: hashed_password}
@@ -160,39 +180,102 @@ except Exception as e:
     joblib = None
 
 
-# Snapshot of the actual existing dynamic-consensus decision, used only for explanation.
+# Snapshot of the exact runtime-measured consensus decision, used by Module 4.
 last_consensus_decision = None
+last_transaction_context = None
 
-# Separate consensus-selector artifacts: never overwrite the existing federated fraud model.
+# Separate consensus selector. The training script must be rerun after changing its
+# feature schema; an old 8-feature model is deliberately rejected instead of misused.
 selector_model = selector_scaler = selector_label_encoder = None
 selector_ready = False
 selector_training_frame = None
+selector_training_ranges = {}
 try:
     import pandas as pd
     import joblib
+    # LIME background / range reference: the rows the selector was actually trained on.
+    # train_consensus_selector.py writes lime_background.csv next to the model.
+    background_path = (
+        CONSENSUS_SELECTOR_BACKGROUND_PATH
+        if os.path.exists(CONSENSUS_SELECTOR_BACKGROUND_PATH) else DATA_PATH
+    )
     if all(os.path.exists(path) for path in (
         CONSENSUS_SELECTOR_MODEL_PATH, CONSENSUS_SELECTOR_SCALER_PATH,
-        CONSENSUS_SELECTOR_ENCODER_PATH, DATA_PATH
+        CONSENSUS_SELECTOR_ENCODER_PATH, background_path
     )):
         selector_model = joblib.load(CONSENSUS_SELECTOR_MODEL_PATH)
         selector_scaler = joblib.load(CONSENSUS_SELECTOR_SCALER_PATH)
         selector_label_encoder = joblib.load(CONSENSUS_SELECTOR_ENCODER_PATH)
-        selector_training_frame = pd.read_csv(DATA_PATH)
-        selector_ready = True
-        print("🧠 Trained consensus selector loaded; Module 4 LIME explains this classifier.")
+        selector_training_frame = pd.read_csv(background_path)
+        selector_training_ranges = load_training_ranges(
+            CONSENSUS_SELECTOR_EVAL_PATH, selector_training_frame
+        )
+        print(f"📐 Selector training ranges ({os.path.basename(background_path)}):")
+        for _f, _r in selector_training_ranges.items():
+            print(f"     {_f}: {_r['min']} .. {_r['max']}")
+        model_feature_count = getattr(selector_model, "n_features_in_", None)
+        if model_feature_count != len(CONSENSUS_FEATURES):
+            print(
+                "⚠️ Consensus selector artifact has an incompatible feature schema "
+                f"({model_feature_count} features; expected {len(CONSENSUS_FEATURES)}). "
+                "Run: python train_consensus_selector.py"
+            )
+        elif not all(feature in selector_training_frame.columns for feature in CONSENSUS_FEATURES):
+            print("⚠️ Training CSV is missing one or more runtime selector features.")
+        else:
+            selector_ready = True
+            print("🧠 Runtime-feature consensus selector loaded; Module 4 will explain its captured decision.")
     else:
-        print("⚠️ Trained consensus selector not found. Run python train_consensus_selector.py.")
+        print("⚠️ Consensus selector artifacts not found. Run python train_consensus_selector.py.")
 except Exception as selector_load_error:
     print(f"⚠️ Consensus selector unavailable: {selector_load_error}")
     selector_ready = False
 
 
 app = Flask(__name__)
-app.secret_key = str(uuid.uuid4())
+def _load_secret_key():
+    """Stable session key so officers are not logged out on every restart."""
+    env_key = os.environ.get("LAND_REGISTRY_SECRET_KEY")
+    if env_key:
+        return env_key
+    key_path = os.path.join(BASE_DIR, ".secret_key")
+    try:
+        if os.path.exists(key_path):
+            with open(key_path, "r", encoding="utf-8") as fh:
+                saved = fh.read().strip()
+                if saved:
+                    return saved
+        new_key = uuid.uuid4().hex + uuid.uuid4().hex
+        with open(key_path, "w", encoding="utf-8") as fh:
+            fh.write(new_key)
+        return new_key
+    except OSError:
+        return uuid.uuid4().hex
+
+
+app.secret_key = _load_secret_key()
+
+AUDIT_LOG_FILE = os.path.join(BASE_DIR, "Dataset", "Audit_Log.jsonl")
+
+
+def audit(event: str, **details):
+    """Append-only audit trail of who did what. One JSON object per line."""
+    try:
+        os.makedirs(os.path.dirname(AUDIT_LOG_FILE), exist_ok=True)
+        try:
+            actor = session.get('username', 'system')
+        except RuntimeError:
+            actor = 'system'
+        record = {"ts": datetime.now().isoformat(timespec="seconds"), "event": event, "actor": actor, **details}
+        with open(AUDIT_LOG_FILE, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, default=str) + "\n")
+    except Exception as exc:
+        print(f"⚠️ Audit log write failed: {exc}")
 app.config['JSONIFY_PRETTYPRINT_REGULAR'] = False
 
 # --- Initial Load of Users ---
-load_users_from_csv()
+if os.environ.get("LAND_REGISTRY_SKIP_BOOT") != "1":
+    load_users_from_csv()
 
 # -----------------------------
 # Data Structures and Utilities (Blockchain Logic)
@@ -213,43 +296,29 @@ def pqc_sign(data: str) -> str:
         data.encode()
     )
     return base64.b64encode(signature).decode()
-def get_transaction_history(self):
-
-    history = []
-
-    # Get transactions from blockchain
-    for block in self.chain:
-        for tx in block.transactions:
-
-            # Ignore genesis block
-            if "land_id" in tx:
-                history.append(tx)
-
-    # Also include pending transactions
-    for tx in self.pending_transactions:
-        if "land_id" in tx:
-            history.append(tx)
-
-    return history
-
-
 def pqc_public_key_b64() -> str:
     return base64.b64encode(PQC_PUBLIC_KEY).decode()
 
 
 class Block:
     """Represents a single block in the blockchain."""
-    def __init__(self, index, timestamp, transactions, previous_hash, nonce=0, proposer=None):
+    def __init__(self, index, timestamp, transactions, previous_hash, nonce=0, proposer=None, consensus=None):
         self.index = index
         self.timestamp = timestamp
         self.transactions = transactions
         self.previous_hash = previous_hash
         self.nonce = nonce
         self.proposer = proposer or 'Genesis'
+        # Protocol that actually forged this block. None for legacy blocks.
+        self.consensus = consensus
 
     def to_dict(self):
-        """Returns a dictionary representation of the block."""
-        return {
+        """Returns a dictionary representation of the block.
+
+        'consensus' is included only when set, so hashes of legacy blocks
+        (created before this field existed) stay unchanged.
+        """
+        data = {
             'index': self.index,
             'timestamp': self.timestamp,
             'transactions': self.transactions,
@@ -257,6 +326,9 @@ class Block:
             'nonce': self.nonce,
             'proposer': self.proposer,
         }
+        if self.consensus is not None:
+            data['consensus'] = self.consensus
+        return data
 
     def hash(self):
         """Calculates the hash of the block."""
@@ -271,6 +343,11 @@ class Network:
         self.blocked_transactions: List[Dict] = []
         self.nodes: Dict[str, Dict] = {}
         self.consensus_mode: str = 'PoW'
+        # Who set the active protocol: 'default', 'ml_selector' or 'manual_override'.
+        self.consensus_source: str = 'default'
+        self.consensus_source_detail: str = 'Initial default protocol'
+        # Persisted summary of the latest selector decision (no model objects).
+        self.last_selection: Dict[str, Any] = {}
         self.difficulty: int = 3
         self.consensus_algos: List[str] = ['PoW', 'PoS', 'Raft', 'PBFT', 'HotStuff']
         self.active_users: Dict[str, bool] = {} # {username: True}
@@ -332,8 +409,9 @@ class Network:
             self.chain.append(Block(
                 index=0,
                 timestamp=time.time(),
-                transactions=[{'message': 'Genesis Block', 'predicted_consensus': 'PoW'}],
-                previous_hash="0" * 64
+                transactions=[{'message': 'Genesis Block'}],
+                previous_hash="0" * 64,
+                consensus='Genesis'
             ))
 
     def get_last_block(self) -> Block:
@@ -379,6 +457,24 @@ class Network:
                 history.append(tx)
 
         return history
+    def get_transaction_history_detailed(self):
+        """Ledger + pending transactions tagged with source and block index."""
+        history = []
+        for block in self.chain:
+            for tx in block.transactions:
+                if isinstance(tx, dict) and "land_id" in tx:
+                    item = dict(tx)
+                    item["source"] = "ledger"
+                    item["block_index"] = block.index
+                    history.append(item)
+        for tx in self.pending_transactions:
+            if isinstance(tx, dict) and "land_id" in tx:
+                item = dict(tx)
+                item["source"] = "pending"
+                item["block_index"] = None
+                history.append(item)
+        return history
+
     def add_land_transaction(self, old_owner, new_owner, land_price, pdf_bytes, land_id):
 
         if land_price <= 0:
@@ -410,6 +506,24 @@ class Network:
 
         if not ok:
             return False, message
+
+        if old_owner.strip().lower() == new_owner.strip().lower():
+            return False, "Seller and beneficiary cannot be the same person."
+
+        # ------------------------------------------
+        # TITLE VERIFICATION (seller must own the land)
+        # ------------------------------------------
+        detailed_history = self.get_transaction_history_detailed()
+        title = verify_title(land_id, old_owner, detailed_history)
+        if not title["allowed"]:
+            return False, title["message"]
+        tx["title_verification"] = title
+
+        # Rule-based owner trust (not an ML model; not a GNN input).
+        trust = compute_owner_trust(old_owner, land_id, detailed_history,
+                                    self.blocked_transactions, title=title)
+        tx["owner_trust"] = trust
+        tx["trust_score"] = trust["score"]
 
         # ------------------------------------------
         # GNN RISK ASSESSMENT
@@ -487,11 +601,24 @@ class Network:
 
         return True, tx
 
-    def set_consensus(self, mode):
+    def set_consensus(self, mode, source='manual_override', detail=None):
         if mode in self.consensus_algos:
             self.consensus_mode = mode
+            self.consensus_source = source
+            self.consensus_source_detail = detail or (
+                'Set by an authorized user from the Validation Engine'
+                if source == 'manual_override' else 'Applied from ML selector prediction'
+            )
             return True
         return False
+
+    def _stamp_block(self, new_block, protocol):
+        """Record the protocol that actually forged the block, on the block and its tx."""
+        new_block.consensus = protocol
+        for tx in new_block.transactions:
+            tx['executed_consensus'] = protocol
+            # Remove the old misleading field if it was ever written.
+            tx.pop('predicted_consensus', None)
 
     def run_pow(self, proposer_node: str) -> Block:
         last_block = self.get_last_block()
@@ -507,8 +634,7 @@ class Network:
             proposer=proposer_node
         )
 
-        # Consensus information
-        new_block.transactions[0]['predicted_consensus'] = 'PoW'
+        self._stamp_block(new_block, 'PoW')
 
         while True:
             new_block.nonce += 1
@@ -545,8 +671,7 @@ class Network:
             previous_hash=last_block.hash(),
             proposer=validator
         )
-        if new_block.transactions:
-             new_block.transactions[0]['predicted_consensus'] = 'PoS'
+        self._stamp_block(new_block, 'PoS')
              
         self.pending_transactions.pop(0)
         self.chain.append(new_block)
@@ -556,6 +681,7 @@ class Network:
         # PBFT requires at least 4 nodes (f = 1)
         n = len(self.nodes)
         if n < 4:
+            self.last_failure_reason = f"PBFT needs at least 4 nodes (n = 3f + 1); only {n} registered."
             return None
 
         last_block = self.get_last_block()
@@ -567,19 +693,15 @@ class Network:
             proposer=proposer_node
         )
 
-        if new_block.transactions:
-            new_block.transactions[0]['predicted_consensus'] = 'PBFT'
+        self._stamp_block(new_block, 'PBFT')
 
         # PBFT theory:
         # n = 3f + 1  =>  f = floor((n - 1) / 3)
         f = (n - 1) // 3
         quorum = 2 * f + 1
 
-        # Assume honest majority (simulation)
-        commit_count = n - f - 1  # excluding proposer
-
-        # Debug (optional)
-        # print(f"PBFT commit votes: {commit_count}, quorum: {quorum}")
+        # Simulation assumes f faulty nodes withhold votes; the proposer votes too.
+        commit_count = n - f
 
         if commit_count >= quorum:
             self.pending_transactions.pop(0)
@@ -590,9 +712,12 @@ class Network:
 
 
     def run_raft(self, proposer_node: str) -> Block:
+        # Leader election (simulated): a node is elected and it proposes the entry.
+        # Majority acknowledgement is assumed in this in-process simulation.
         leader = random.choice(list(self.nodes.keys()))
-        if leader != proposer_node:
-             return None
+        if len(self.nodes) < 1:
+            self.last_failure_reason = "Raft needs at least one node."
+            return None
 
         last_block = self.get_last_block()
         new_block = Block(
@@ -602,8 +727,7 @@ class Network:
             previous_hash=last_block.hash(),
             proposer=leader
         )
-        if new_block.transactions:
-             new_block.transactions[0]['predicted_consensus'] = 'Raft'
+        self._stamp_block(new_block, 'Raft')
 
         self.pending_transactions.pop(0)    
         self.chain.append(new_block)
@@ -611,6 +735,7 @@ class Network:
 
     def run_hotstuff(self, proposer_node: str) -> Block:
         if len(self.nodes) < 3:
+             self.last_failure_reason = f"HotStuff needs at least 3 nodes; only {len(self.nodes)} registered."
              return None
 
         last_block = self.get_last_block()
@@ -621,8 +746,7 @@ class Network:
             previous_hash=last_block.hash(),
             proposer=proposer_node
         )
-        if new_block.transactions:
-             new_block.transactions[0]['predicted_consensus'] = 'HotStuff'
+        self._stamp_block(new_block, 'HotStuff')
 
         self.pending_transactions.pop(0)
         self.chain.append(new_block)
@@ -635,25 +759,74 @@ class Network:
 
         proposer_node = random.choice(list(self.nodes.keys()))
         new_block = None
+        # Each transaction is committed with the protocol assigned to it when it was
+        # queued (the ML-selected or overridden protocol at that moment). Older
+        # transactions without an assignment use the active protocol.
+        head = self.pending_transactions[0]
+        protocol_used = head.get('assigned_consensus') if isinstance(head, dict) else None
+        if protocol_used not in self.consensus_algos:
+            protocol_used = self.consensus_mode
+        self.last_failure_reason = None
+        round_started = time.perf_counter()
 
-        if self.consensus_mode == 'PoW':
-            new_block = self.run_pow(proposer_node)
-        elif self.consensus_mode == 'PoS':
-            new_block = self.run_pos(proposer_node)
-        elif self.consensus_mode == 'PBFT':
-            new_block = self.run_pbft(proposer_node)
-        elif self.consensus_mode == 'Raft':
-            new_block = self.run_raft(proposer_node)
-        elif self.consensus_mode == 'HotStuff':
-            new_block = self.run_hotstuff(proposer_node)
+        runner = {
+            'PoW': self.run_pow, 'PoS': self.run_pos, 'PBFT': self.run_pbft,
+            'Raft': self.run_raft, 'HotStuff': self.run_hotstuff,
+        }.get(protocol_used)
+        if runner:
+            new_block = runner(proposer_node)
 
         if new_block:
+            round_ms = (time.perf_counter() - round_started) * 1000.0
+            runtime_metrics.record_consensus_round(
+                duration_ms=round_ms,
+                committed_transactions=len(new_block.transactions),
+                protocol=protocol_used,
+            )
             for node in self.nodes.values():
                  node['chain_length'] = len(self.chain)
 
-            return {'success': True, 'result': f'Block {new_block.index} forged via {self.consensus_mode}'}
+            return {
+                'success': True,
+                'result': (f'Block {new_block.index} forged via {protocol_used} in {round_ms:.1f} ms '
+                           f'(transaction {new_block.transactions[0].get("land_id", "")})'),
+                'block_index': new_block.index,
+                'consensus': protocol_used,
+                'round_ms': round_ms,
+            }
         else:
-            return {'success': False, 'result': f'Consensus failed for {self.consensus_mode}.'}
+            reason = getattr(self, 'last_failure_reason', None) or 'Quorum not reached.'
+            return {'success': False, 'result': f'Consensus failed for {protocol_used}: {reason}'}
+
+    def probe_consensus_round(self):
+        """Time one dry-run round of the ACTIVE protocol without changing the ledger.
+
+        Used when no real block has been forged recently, so the selector has a
+        measured latency instead of none. The chain and queue are restored
+        afterwards; nothing is committed and throughput is not affected.
+        """
+        chain_len = len(self.chain)
+        saved_pending = list(self.pending_transactions)
+        saved_nodes = {k: dict(v) for k, v in self.nodes.items()}
+        dummy = {"probe": True, "id": "probe-" + uuid.uuid4().hex[:8], "timestamp": datetime.now().isoformat()}
+        self.pending_transactions = [dummy]
+        protocol = self.consensus_mode
+        started = time.perf_counter()
+        try:
+            runner = {
+                'PoW': self.run_pow, 'PoS': self.run_pos, 'PBFT': self.run_pbft,
+                'Raft': self.run_raft, 'HotStuff': self.run_hotstuff,
+            }.get(protocol)
+            block = runner(random.choice(list(self.nodes.keys()))) if runner else None
+            duration_ms = (time.perf_counter() - started) * 1000.0
+        finally:
+            del self.chain[chain_len:]
+            self.pending_transactions = saved_pending
+            self.nodes = saved_nodes
+        if block is None:
+            return None
+        runtime_metrics.record_consensus_round(duration_ms, 0, protocol, kind='probe')
+        return duration_ms
 
 
     def resolve_conflicts(self):
@@ -688,6 +861,15 @@ def save_network_state():
 
             'consensus_mode':
                 network.consensus_mode,
+
+            'consensus_source':
+                network.consensus_source,
+
+            'consensus_source_detail':
+                network.consensus_source_detail,
+
+            'last_selection':
+                network.last_selection,
 
             'difficulty':
                 network.difficulty,
@@ -788,7 +970,8 @@ def load_network_state():
                     ),
                     proposer=block_data.get(
                         'proposer'
-                    )
+                    ),
+                    consensus=block_data.get('consensus')
                 )
 
                 network.chain.append(block)
@@ -827,6 +1010,12 @@ def load_network_state():
                 'difficulty',
                 3
             )
+
+            network.consensus_source = state.get('consensus_source', 'default')
+            network.consensus_source_detail = state.get(
+                'consensus_source_detail', 'Restored from saved ledger state'
+            )
+            network.last_selection = state.get('last_selection', {}) or {}
 
             network.consensus_algos = state.get(
                 'consensus_algos',
@@ -999,7 +1188,10 @@ def ensure_default_users():
 # -------------------------------------
 
 network = None
-load_network_state()  # will call ensure_default_users internally
+# benchmark_consensus.py imports this module only for the Network/Block classes;
+# it sets LAND_REGISTRY_SKIP_BOOT=1 so the real ledger is never loaded or saved.
+if os.environ.get("LAND_REGISTRY_SKIP_BOOT") != "1":
+    load_network_state()  # will call ensure_default_users internally
 
 # A simple wrapper to handle persistence for API/Action routes
 def persist_action(func):
@@ -1238,28 +1430,30 @@ def add_graph_edge():
 def get_state():
     load_network_state()
     last_block = network.get_last_block()
-    
-    # Get prediction from the latest transaction in the last block 
-    # or use a default if the chain is just starting.
-    prediction = "PoW" # Default
-    trigger_source = "System (Default)"
-    
-    if last_block and last_block.transactions:
-        # Assuming the 'predicted_consensus' was stored in the transaction data
-        prediction = last_block.transactions[0].get('predicted_consensus', "PoW")
-        trigger_source = "ML Model (Network Load)"
+    selection = network.last_selection or {}
 
     return jsonify({
         'chain': [block.to_dict() for block in network.chain],
         'pending_transactions': network.pending_transactions,
         'blocked_transactions': network.blocked_transactions,
         'nodes': network.nodes,
-        'consensus_mode': network.consensus_mode,
-        'predicted_mode': prediction,       # <--- ADD THIS
-        'prediction_trigger': trigger_source, # <--- ADD THIS
+        # Three separate values; the UI must never merge them.
+        'consensus_mode': network.consensus_mode,            # active protocol used for the NEXT block
+        'consensus_source': network.consensus_source,        # default / ml_selector / manual_override
+        'consensus_source_detail': network.consensus_source_detail,
+        'predicted_mode': selection.get('predicted_consensus'),   # latest ML output
+        'prediction_applied': selection.get('selection_applied'),
+        'prediction_status': selection.get('status'),
+        'prediction_out_of_range': [o.get('feature') for o in selection.get('out_of_training_range', [])],
+        'last_block_consensus': last_block.consensus or (
+            (last_block.transactions[0].get('executed_consensus')
+             or last_block.transactions[0].get('predicted_consensus'))
+            if last_block.transactions else None
+        ),
         'difficulty': network.difficulty,
         'consensus_algos': network.consensus_algos,
-        'ml_ready': model_ready,
+        'ml_ready': selector_ready,
+        'selector_model_version': SELECTOR_MODEL_VERSION,
         'last_block_hash': last_block.hash(),
         'node_count': len(network.nodes),
         'current_user': session.get('username', 'Guest')
@@ -1355,26 +1549,35 @@ def remove_node():
     return jsonify({'success': success, 'message': f"Node {name} removed."})
 
 @app.route('/api/add_land_tx', methods=['POST'])
-
 def add_land_tx():
+    global last_consensus_decision, last_transaction_context
+    load_network_state()
+    request_started = time.perf_counter()
     current_user = session.get('username', 'Anonymous')
-    
-    # Check if user is active (approved by community)
-    
-    if current_user not in network.active_users:
-        return jsonify({'success': False, 'message': f'User "{current_user}" is not yet approved by the community. Please wait for approval.'}), 403
-    
-    old_owner = current_user
-    land_id = request.form.get('land_id')
-    new_owner = request.form.get('new_owner')
-    land_price = int(request.form.get('land_price', 0))
-    pdf_file = request.files.get('pdf')
 
+    if current_user not in network.active_users:
+        return jsonify({
+            'success': False,
+            'message': f'User "{current_user}" is not yet approved by the community. Please wait for approval.'
+        }), 403
+
+    old_owner = current_user
+    land_id = (request.form.get('land_id') or '').strip()
+    new_owner = (request.form.get('new_owner') or '').strip()
+    try:
+        land_price = int(request.form.get('land_price', 0))
+    except (TypeError, ValueError):
+        return jsonify({'success': False, 'message': 'Transaction value must be a valid positive number.'}), 400
+
+    pdf_file = request.files.get('pdf')
     if not pdf_file:
-        return jsonify({'success': False, 'message': 'PDF document required.'})
+        return jsonify({'success': False, 'message': 'PDF document required.'}), 400
+    if not land_id or not new_owner:
+        return jsonify({'success': False, 'message': 'Land ID and beneficiary name are required.'}), 400
+    if land_price <= 0:
+        return jsonify({'success': False, 'message': 'Transaction value must be positive.'}), 400
 
     pdf_bytes = pdf_file.read()
-
     success, result = network.add_land_transaction(
         old_owner=old_owner,
         new_owner=new_owner,
@@ -1383,171 +1586,411 @@ def add_land_tx():
         land_id=land_id
     )
 
+    # Full request time (PDF hash + PQC + GNN + SHAP). Diagnostic only;
+    # it is NOT the selector's latency input any more.
+    runtime_metrics.record_request_latency((time.perf_counter() - request_started) * 1000.0)
+
     if not success:
-
-        # HIGH-risk transaction was blocked by AI
         if isinstance(result, dict) and result.get("blocked"):
-
-            print("Saving HIGH-risk blocked transaction...")
+            blocked_tx = result.get("transaction") or {}
+            risk_result = result.get("risk_assessment") or blocked_tx.get("risk_assessment") or {}
+            last_transaction_context = {
+                "transaction": copy.deepcopy(blocked_tx),
+                "risk_assessment": copy.deepcopy(risk_result),
+                "status": "blocked",
+                "timestamp": time.time(),
+            }
             save_network_state()
-
+            audit("transaction_blocked", transaction_id=blocked_tx.get("id"), land_id=blocked_tx.get("land_id"),
+                  risk_score=risk_result.get("risk_score"))
             return jsonify({
                 'success': False,
                 'blocked': True,
-                'message': result["message"],
-                'transaction': result["transaction"],
-                'risk_assessment': result["risk_assessment"]
+                'message': result.get("message", "Transaction blocked by risk assessment."),
+                'transaction': blocked_tx,
+                'risk_assessment': risk_result,
             })
+        audit("transaction_rejected", land_id=land_id, reason=str(result))
+        return jsonify({'success': False, 'message': result}), 400
 
-        # Other failures such as duplicate transaction
-        return jsonify({
-            'success': False,
-            'message': result
-        })
+    risk_result = result.get("risk_assessment") or {}
+    audit("transaction_queued", transaction_id=result.get("id"), land_id=land_id,
+          new_owner=new_owner, risk_score=risk_result.get("risk_score"),
+          trust_score=result.get("trust_score"),
+          title_status=(result.get("title_verification") or {}).get("status"))
+    last_transaction_context = {
+        "transaction": copy.deepcopy(result),
+        "risk_assessment": copy.deepcopy(risk_result),
+        "status": "queued",
+        "timestamp": time.time(),
+    }
 
-
-    print("Saving transaction to blockchain state...")
+    decision = _run_consensus_selection(result, risk_result)
     save_network_state()
 
-    print(
-        "Saved pending transactions:",
-        len(network.pending_transactions)
-    )
-
-    print(
-        "Saved pending transactions:",
-        len(network.pending_transactions)
-    )
-
-    # Preserve the project's existing dynamic-consensus pipeline: use the same
-    # labelled network-metrics row, model prediction, online update, and set_consensus.
-    # Module 4 records and explains this exact decision; it does not make a second one.
-    global last_consensus_decision
-    predicted_consensus = network.consensus_mode
-    decision_features = None
-    decision_model_snapshot = None
-    true_label = None
-    try:
-        if model_ready and df_traffic is not None and not df_traffic.empty:
-            sampled_row = df_traffic.sample(n=1).iloc[0]
-            decision_features = {feature: float(sampled_row[feature]) for feature in MODEL_FEATURES}
-            features_df = sampled_row[MODEL_FEATURES].to_frame().T
-            scaled_features = scaler.transform(features_df.values)
-            # Snapshot the exact model state that made this prediction, before online update.
-            decision_model_snapshot = copy.deepcopy(model)
-            prediction = model.predict(scaled_features)[0]
-            predicted_consensus = str(label_encoder.inverse_transform([int(prediction)])[0])
-            if 'consensus' in sampled_row.index:
-                true_label = str(sampled_row['consensus'])
-            network.set_consensus(predicted_consensus)
-            if true_label is not None:
-                online_update(scaled_features, true_label)
-            print(f"Dynamic consensus selected: {predicted_consensus}; active mode: {network.consensus_mode}; dataset label: {true_label}")
-            last_consensus_decision = {
-                'selected_consensus': predicted_consensus,
-                'active_consensus': network.consensus_mode,
-                'features': decision_features,
-                'model_snapshot': decision_model_snapshot,
-                'source': 'Existing dynamic consensus pipeline using a sampled row from Current_Network_Metrics.csv',
-                'true_label': true_label,
-                'transaction_id': result.get('transaction_id', result.get('id')),
-                'timestamp': time.time(),
-            }
-        else:
-            last_consensus_decision = None
-            print('Dynamic consensus model unavailable; existing active consensus retained.')
-    except Exception as consensus_error:
-        app.logger.exception('Existing dynamic consensus selection failed')
-        # Do not claim a new selection if the existing pipeline failed.
-        last_consensus_decision = None
-
-    result['selected_consensus'] = predicted_consensus
-    result['executed_consensus'] = network.consensus_mode
+    message = 'Land transaction added to queue.'
+    if decision['status'] == 'applied':
+        message += f" ML selector assigned {decision['predicted_consensus']} to this transfer."
+    elif decision['status'] == 'rejected_out_of_training_range':
+        names = ', '.join(o['feature'] for o in decision['out_of_training_range'])
+        message += (f" ML predicted {decision['predicted_consensus']}, but it was NOT applied "
+                    f"({names} outside training range). Active protocol stays {network.consensus_mode}.")
+    else:
+        message += f" Consensus selection skipped: {decision.get('reason')}"
 
     return jsonify({
         'success': True,
-        'message': 'Land transaction added to queue.',
-        'transaction': result
+        'message': message,
+        'transaction': result,
+        'consensus_decision': {k: v for k, v in decision.items() if k not in _NON_JSON_DECISION_KEYS},
+    })
+
+
+_NON_JSON_DECISION_KEYS = {"model_snapshot", "scaler_snapshot", "label_encoder_snapshot", "training_frame"}
+
+
+def _run_consensus_selection(tx: Dict[str, Any], risk_result: Dict[str, Any]) -> Dict[str, Any]:
+    """Predict a protocol from runtime inputs, check the training range, and apply only if safe.
+
+    Writes the outcome onto the queued transaction and into network.last_selection,
+    so the queue card, /api/state, the ledger and Module 4 all read the same record.
+    """
+    global last_consensus_decision
+    active_before = network.consensus_mode
+
+    def finish(status, reason, extra=None):
+        record = {
+            "status": status,
+            "reason": reason,
+            "predicted_consensus": None,
+            "selection_applied": False,
+            "active_consensus_before": active_before,
+            "active_consensus_after": network.consensus_mode,
+            "transaction_id": tx.get("id"),
+            "land_id": tx.get("land_id"),
+            "timestamp": time.time(),
+            "out_of_training_range": [],
+            "model_version": SELECTOR_MODEL_VERSION,
+            "risk_summary": {k: risk_result.get(k) for k in
+                             ("risk_score", "risk_level", "recommendation", "fraud_probability")},
+            "owner_trust": tx.get("owner_trust"),
+        }
+        record.update(extra or {})
+        tx['ml_predicted_consensus'] = record["predicted_consensus"]
+        tx['ml_selection_applied'] = record["selection_applied"]
+        tx['ml_selection_status'] = status
+        tx['ml_model_version'] = SELECTOR_MODEL_VERSION
+        tx['active_consensus_when_queued'] = network.consensus_mode
+        # Protocol this transaction will be committed with (see run_consensus).
+        tx['assigned_consensus'] = network.consensus_mode
+        # Clean up the old, ambiguous field names from earlier versions.
+        for old_key in ('selected_consensus', 'executed_consensus', 'selection_applied',
+                        'consensus_selection_status', 'consensus_selection_warning'):
+            tx.pop(old_key, None)
+        network.last_selection = {k: v for k, v in record.items() if k not in _NON_JSON_DECISION_KEYS
+                                  and k not in ("transaction", "risk_assessment")}
+        audit("consensus_selection", transaction_id=tx.get("id"), status=status,
+              predicted=record["predicted_consensus"], applied=record["selection_applied"],
+              active_after=network.consensus_mode,
+              out_of_range=[o.get("feature") for o in record.get("out_of_training_range", [])])
+        return record
+
+    if not selector_ready:
+        last_consensus_decision = None
+        return finish("selector_unavailable",
+                      "Selector model is not loaded. Run python train_consensus_selector.py.")
+
+    try:
+        risk_pct = float(risk_result["risk_score"]) if risk_result.get("risk_score") is not None else None
+    except (TypeError, ValueError):
+        risk_pct = None
+
+    # No block forged recently (e.g. right after a restart): time a dry-run
+    # round of the active protocol so latency is measured, not missing.
+    if not runtime_metrics.has_recent_round():
+        try:
+            network.probe_consensus_round()
+        except Exception:
+            app.logger.exception("Consensus probe failed")
+
+    ft_value, ft_rule = policy_fault_tolerance(tx.get("land_price"), risk_result.get("risk_level"))
+    snapshot = runtime_metrics.snapshot(
+        active_node_count=len(network.nodes),
+        fraud_risk_score_pct=risk_pct,
+        fault_tolerance_requirement=ft_value,
+        active_consensus=network.consensus_mode,
+        fault_tolerance_source=ft_rule,
+        append_observation=False,
+    )
+    features = snapshot["features"]
+    missing = [name for name in CONSENSUS_FEATURES if features.get(name) is None]
+    if missing:
+        runtime_metrics.append_observation(snapshot, [])
+        last_consensus_decision = None
+        return finish("awaiting_measurements",
+                      f"Missing runtime measurements: {', '.join(missing)}",
+                      {"features": features, "input_sources": snapshot["input_sources"]})
+
+    try:
+        prediction = predict_consensus(selector_model, selector_scaler, selector_label_encoder, features)
+    except Exception as exc:
+        app.logger.exception("Consensus selector prediction failed")
+        last_consensus_decision = None
+        return finish("selection_failed", str(exc))
+
+    predicted = prediction["predicted_consensus"]
+    out_of_range = check_training_range(features, selector_training_ranges)
+    runtime_metrics.append_observation(snapshot, [o["feature"] for o in out_of_range])
+
+    if out_of_range:
+        status = "rejected_out_of_training_range"
+        reason = ("Prediction not applied: " + "; ".join(
+            f"{o['feature']}={o['value']:.4g} is {o['direction']} training range "
+            f"[{o['training_min']:.4g}, {o['training_max']:.4g}]" for o in out_of_range))
+        applied = False
+    elif predicted not in network.consensus_algos:
+        status, reason, applied = "rejected_unknown_protocol", f"Unknown protocol {predicted}", False
+    elif ineligibility_reason(predicted, len(network.nodes), features["security_risk_score"],
+                              features["fault_tolerance_requirement"]):
+        # Safety guard: the ML output is never applied if it breaks the written policy.
+        status = "rejected_by_policy"
+        reason = "Prediction not applied: " + ineligibility_reason(
+            predicted, len(network.nodes), features["security_risk_score"], features["fault_tolerance_requirement"])
+        applied = False
+    elif predicted == network.consensus_mode:
+        status, reason, applied = "applied", f"Prediction confirms the active protocol {predicted}; no switch needed.", True
+        network.consensus_source = 'ml_selector'
+        network.consensus_source_detail = f"Confirmed by ML prediction for transaction {tx.get('id')}"
+    else:
+        network.set_consensus(predicted, source='ml_selector',
+                              detail=f"Applied from ML prediction for transaction {tx.get('id')}")
+        status, reason, applied = "applied", (
+            f"All inputs inside training range and policy-eligible; switched {active_before} → {predicted} "
+            "for this transfer and new transfers."), True
+
+    record = finish(status, reason, {
+        "predicted_consensus": predicted,
+        "selection_applied": applied,
+        "class_probabilities": prediction["class_probabilities"],
+        "features": {n: float(features[n]) for n in CONSENSUS_FEATURES},
+        "input_sources": snapshot["input_sources"],
+        "source_types": snapshot["source_types"],
+        "runtime_metrics": snapshot["measurements"],
+        "limitations": snapshot["limitations"],
+        "out_of_training_range": out_of_range,
+        "training_ranges": selector_training_ranges,
+    })
+
+    # In-memory copy with the exact model objects, so Module 4 explains this decision.
+    last_consensus_decision = dict(record)
+    last_consensus_decision.update({
+        "model_snapshot": copy.deepcopy(selector_model),
+        "scaler_snapshot": copy.deepcopy(selector_scaler),
+        "label_encoder_snapshot": copy.deepcopy(selector_label_encoder),
+        "training_frame": selector_training_frame,
+        "transaction": copy.deepcopy(tx),
+        "risk_assessment": copy.deepcopy(risk_result),
+    })
+    print(f"[consensus-selector] predicted={predicted} status={status} "
+          f"active={network.consensus_mode} inputs={record['features']}")
+    return record
+
+
+def _selector_model_info():
+    try:
+        with open(CONSENSUS_SELECTOR_EVAL_PATH, "r", encoding="utf-8") as fh:
+            ev = json.load(fh)
+        return {
+            "training_source": ev.get("training_source", "historical (legacy artifact)"),
+            "rows_used": ev.get("rows_used"),
+            "classes": ev.get("classes"),
+            "test_accuracy": ev.get("test_accuracy"),
+            "independent_accuracy": (ev.get("independent_evaluation") or {}).get("accuracy"),
+            "independent_rows": (ev.get("independent_evaluation") or {}).get("rows"),
+            "grouped_unseen_risk_accuracy": ((ev.get("grouped_evaluation") or {})
+                                             .get("unseen_security_risk_values") or {}).get("mean_accuracy"),
+            "trained_at": ev.get("trained_at"),
+            "warning": ev.get("warning"),
+        }
+    except Exception:
+        return {"training_source": "unknown"}
+
+
+SELECTOR_MODEL_VERSION = (lambda info: f"{info.get('training_source', 'unknown')}@{info.get('trained_at', 'unknown')}")(_selector_model_info())
+
+
+@app.route('/api/ledger/verify', methods=['GET'])
+def verify_ledger_route():
+    """Check hash links and report the protocol recorded for every block."""
+    load_network_state()
+    broken, blocks = [], []
+    for i, blk in enumerate(network.chain):
+        tx0 = blk.transactions[0] if blk.transactions else {}
+        recorded = blk.consensus or tx0.get('executed_consensus') or tx0.get('predicted_consensus')
+        link_ok = True if i == 0 else blk.previous_hash == network.chain[i - 1].hash()
+        if not link_ok:
+            broken.append(blk.index)
+        blocks.append({
+            "index": blk.index,
+            "consensus": recorded,
+            "record_type": "block field" if blk.consensus else ("legacy tx field" if recorded else "missing"),
+            "hash_link_ok": link_ok,
+        })
+    return jsonify({
+        "valid": not broken,
+        "blocks_checked": len(blocks),
+        "broken_links_at": broken,
+        "blocks": blocks,
     })
 
 
 @app.route('/api/consensus/explanation', methods=['GET'])
 def consensus_explanation_route():
-    """Explain the actual decision made by the existing dynamic consensus pipeline."""
+    """Explain the exact selector decision captured for the latest queued transaction."""
     try:
         load_network_state()
+        active_mode = network.consensus_mode
         decision = last_consensus_decision
-        active_mode = getattr(network, 'consensus_mode', 'PoW')
-        if not decision:
+        common = {
+            'current_consensus': active_mode,
+            'consensus_source': network.consensus_source,
+            'consensus_source_detail': network.consensus_source_detail,
+            'last_block_consensus': network.get_last_block().consensus,
+        }
+
+        summary = network.last_selection or {}
+        if (not decision and selector_ready and summary.get("predicted_consensus")
+                and summary.get("features")):
+            # Server restarted: rebuild the decision from the persisted record with the
+            # loaded model. explain_consensus() flags it if the model no longer agrees.
+            decision = dict(summary)
+            decision.update({
+                "model_snapshot": selector_model,
+                "scaler_snapshot": selector_scaler,
+                "label_encoder_snapshot": selector_label_encoder,
+                "training_frame": selector_training_frame,
+                "transaction": {"id": summary.get("transaction_id"),
+                                "trust_score": (summary.get("owner_trust") or {}).get("score"),
+                                "owner_trust": summary.get("owner_trust")},
+                "risk_assessment": summary.get("risk_summary") or {},
+                "restored_from_ledger_state": True,
+            })
+
+        if not decision or decision.get("predicted_consensus") is None:
+            context = last_transaction_context or {}
+            risk = context.get("risk_assessment") or {}
             return jsonify({
                 'module': 'Module 4 — Explainable Dynamic Consensus',
-                'error': 'No dynamic-consensus decision has been captured in this server session yet. Submit a land transaction to run the existing selector, then refresh this explanation.',
-                'selected_consensus': None,
-                'current_consensus': active_mode,
-                'lime_explanation': {'method': 'LIME not run', 'features': [], 'warning': 'No actual selection event is available to explain.'},
-                'decision_method': 'Existing dynamic consensus pipeline',
+                'error': summary.get('reason') or (
+                    'No selector decision has been captured in this server session. '
+                    'Submit a transaction (and forge at least one block so round latency can be measured).'),
+                'selected_consensus': summary.get('predicted_consensus'),
+                'selection_applied': summary.get('selection_applied'),
+                'selection_status': summary.get('status'),
+                'risk_score': risk.get('risk_score', (summary.get('risk_summary') or {}).get('risk_score')),
+                'risk_level': risk.get('risk_level', 'Unavailable'),
+                'trust_score': (summary.get('owner_trust') or {}).get('score'),
+                'owner_trust': summary.get('owner_trust'),
+                'input_sources': summary.get('input_sources', {}),
+                'lime_explanation': {'method': 'LIME not run', 'features': [],
+                                     'warning': 'No captured model decision to explain in this session.'},
+                **common,
             })
-        if not model_ready or scaler is None or label_encoder is None or df_traffic is None:
-            return jsonify({'error': 'The existing dynamic consensus model or its dataset is unavailable; cannot explain the actual selection.'}), 503
 
-        # Use the exact feature row and the exact model snapshot that selected the protocol.
-        # Do not predict again using a different/random row inside the explanation endpoint.
-        snapshot = decision.get('model_snapshot') or model
-        features = dict(decision.get('features') or {})
-        required = list(MODEL_FEATURES)
-        missing = [name for name in required if name not in features]
-        if missing:
-            return jsonify({'error': f'The captured selection is missing features: {missing}'}), 500
-        expected_prediction = decision.get('selected_consensus')
-        from consensus_explainer import explain_consensus
         result = explain_consensus(
-            risk_assessment={}, transaction={},
-            network_metrics={'input_sources': {name: decision.get('source', 'Existing dynamic selector input') for name in required}},
-            active_nodes=len(getattr(network, 'nodes', {}) or {}),
+            risk_assessment=decision.get("risk_assessment") or {},
+            transaction=decision.get("transaction") or {},
+            network_metrics={
+                "input_sources": decision.get("input_sources", {}),
+                "source_types": decision.get("source_types", {}),
+                "measurements": decision.get("runtime_metrics", {}),
+                "limitations": decision.get("limitations", []),
+            },
+            active_nodes=len(network.nodes),
             current_mode=active_mode,
-            model=snapshot, scaler=scaler, label_encoder=label_encoder,
-            training_frame=df_traffic, current_features=features,
+            model=decision["model_snapshot"],
+            scaler=decision["scaler_snapshot"],
+            label_encoder=decision["label_encoder_snapshot"],
+            training_frame=decision["training_frame"],
+            current_features=decision.get("features", {}),
+            expected_consensus=decision.get("predicted_consensus"),
+            training_ranges=decision.get("training_ranges"),
         )
-        # Preserve the actual selected label. If re-prediction does not match the captured
-        # decision, flag it rather than silently presenting a different explanation.
-        result['selected_consensus'] = expected_prediction
-        result['current_consensus'] = active_mode
-        result['selection_matches_current'] = expected_prediction == active_mode
-        result['decision_method'] = 'Existing dynamic consensus selector (FL_SGD model)' 
-        result['reason'] = f"The existing dynamic consensus selector selected {expected_prediction} for the captured input row. Module 4 explains this decision; it does not generate a new recommendation."
-        result['algorithm_explanation'] = f"Actually selected by the existing selector: {expected_prediction}. Active blockchain mode now: {active_mode}."
-        result['source_transaction'] = decision.get('transaction_id') or 'Most recent captured selection'
-        result['selection_source'] = decision.get('source')
-        result['training_label'] = decision.get('true_label')
-        result['decision_timestamp'] = decision.get('timestamp')
-        result['model_prediction_matches_captured'] = result.get('lime_explanation', {}).get('target_consensus') == expected_prediction
-        result['method_note'] = 'LIME explains the exact model snapshot and feature row captured when the existing dynamic selector made its decision. Dataset values are not live network measurements unless separately instrumented. The explanation endpoint does not select or change consensus.'
+        predicted = decision.get("predicted_consensus")
+        applied = bool(decision.get("selection_applied"))
+        result.update(common)
+        result.update({
+            'selection_applied': applied,
+            'selection_status': decision.get('status'),
+            'selection_reason': decision.get('reason'),
+            'active_consensus_before': decision.get('active_consensus_before'),
+            'active_consensus_after': decision.get('active_consensus_after'),
+            'source_transaction': decision.get('transaction_id'),
+            'source_land_id': decision.get('land_id'),
+            'owner_trust': (decision.get('transaction') or {}).get('owner_trust') or decision.get('owner_trust'),
+            'restored_from_ledger_state': bool(decision.get('restored_from_ledger_state')),
+            'decision_timestamp': decision.get('timestamp'),
+            'reason': (
+                f"The selector predicted {predicted} from the captured runtime inputs. "
+                + ("It was applied as the active protocol." if applied else
+                   f"It was NOT applied; the active protocol stayed {decision.get('active_consensus_after')}.")
+                + " LIME explains this same model and input; it does not make a second selection."
+            ),
+            'algorithm_explanation': (
+                f"ML prediction: {predicted} · Applied: {'yes' if applied else 'no'} · "
+                f"Active protocol for new transfers: {active_mode} ({network.consensus_source.replace('_', ' ')})"
+            ),
+            'model_info': _selector_model_info(),
+            'method_note': (
+                "Selection and LIME share the captured model, scaler, label encoder and feature vector. "
+                "Latency is the median in-process consensus round time (not P2P RTT); throughput is the "
+                "application commit rate; security risk is the GNN score / 100; fault tolerance is configured "
+                "policy. The full HTTP request time is shown for diagnostics only and is not a model input."
+            ),
+        })
         return jsonify(result)
     except Exception as exc:
-        app.logger.exception('Module 4 actual-selection explanation failed')
-        return jsonify({'error': 'Unable to explain the captured dynamic-consensus decision.', 'detail': str(exc)}), 500
+        app.logger.exception('Module 4 explanation failed')
+        return jsonify({
+            'error': 'Unable to explain the captured consensus decision.',
+            'detail': str(exc)
+        }), 500
+
 
 @app.route('/api/set_consensus', methods=['POST'])
 @persist_action
 def set_consensus():
-    mode = request.json.get('mode')
-    success = network.set_consensus(mode)
+    """Explicit manual override by an approved user. Recorded as such."""
+    current_user = session.get('username', 'Anonymous')
+    if current_user not in network.active_users:
+        return jsonify({'success': False, 'message': 'Only approved members can override the protocol.'}), 403
+    mode = (request.json or {}).get('mode')
+    success = network.set_consensus(
+        mode, source='manual_override',
+        detail=f"Manual override by {current_user} at {datetime.now().isoformat(timespec='seconds')}"
+    )
     if success:
-        return jsonify({'success': True, 'message': f'Consensus set to {mode}.'})
-    else:
-        return jsonify({'success': False, 'message': f'Invalid consensus mode: {mode}.'})
+        # An override applies to everything not yet committed.
+        for pending_tx in network.pending_transactions:
+            if isinstance(pending_tx, dict):
+                pending_tx['assigned_consensus'] = mode
+        audit("manual_override", mode=mode, pending_reassigned=len(network.pending_transactions))
+        return jsonify({'success': True, 'message': f'Active protocol manually set to {mode}; '
+                        f'{len(network.pending_transactions)} pending transaction(s) reassigned.'})
+    return jsonify({'success': False, 'message': f'Invalid consensus mode: {mode}.'})
+
 
 @app.route('/api/trigger', methods=['POST'])
 @persist_action
 def trigger_consensus():
+    """Forge the oldest pending transfer with the protocol assigned to it. Does not change the protocol."""
     current_user = session.get('username', 'Anonymous')
-    
-    # Check if user is active (approved by community)
-    load_network_state()
     if current_user not in network.active_users:
-        return jsonify({'success': False, 'message': f'Only approved members can trigger consensus. Your account is still pending community approval.'}), 403
-    
+        return jsonify({'success': False, 'message': 'Only approved members can trigger consensus. Your account is still pending community approval.'}), 403
+
     result = network.run_consensus()
+    audit("block_forge", success=result.get('success'), consensus=result.get('consensus'),
+          block_index=result.get('block_index'), detail=result.get('result'))
     return jsonify(result)
 
 @app.route('/api/resolve', methods=['POST'])
@@ -2000,14 +2443,15 @@ INDEX_HTML = """
 
     <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
         <div class="card p-5">
-            <p class="text-xs font-bold text-slate-400 uppercase tracking-wider mb-1">ML Prediction</p>
+            <p class="text-xs font-bold text-slate-400 uppercase tracking-wider mb-1">Active Protocol (new transfers)</p>
             <div id="current-consensus" class="text-2xl font-bold text-slate-800">...</div>
-            <div class="mt-2 text-xs text-slate-500 bg-slate-50 p-1 rounded">Difficulty Level: <span id="difficulty" class="font-bold text-blue-600">0</span></div>
+            <div id="consensus-source" class="mt-2 text-xs text-slate-500">Set by: …</div>
+            <div class="mt-1 text-xs text-slate-500 bg-slate-50 p-1 rounded">PoW difficulty: <span id="difficulty" class="font-bold text-blue-600">0</span> · Last block: <span id="last-block-consensus" class="font-bold">—</span></div>
         </div>
         <div class="card p-5">
-            <p class="text-xs font-bold text-slate-400 uppercase tracking-wider mb-1">Current Consensus</p>
+            <p class="text-xs font-bold text-slate-400 uppercase tracking-wider mb-1">Latest ML Prediction</p>
             <div id="predicted-consensus" class="text-2xl font-bold text-indigo-600 italic">...</div>
-            <div id="prediction-trigger" class="mt-2 text-xs text-slate-400 truncate">Source: System</div>
+            <div id="prediction-trigger" class="mt-2 text-xs text-slate-500">No prediction yet</div>
         </div>
         <div class="card p-5">
             <p class="text-xs font-bold text-slate-400 uppercase tracking-wider mb-1">Network Nodes</p>
@@ -2077,15 +2521,18 @@ INDEX_HTML = """
                 <h2 class="text-lg font-bold mb-4 text-slate-800">Validation Engine</h2>
                 <div class="space-y-4">
                     <div>
-                        <label class="text-xs font-semibold text-slate-500 mb-1 block">Override Protocol</label>
+                        <label class="text-xs font-semibold text-slate-500 mb-1 block">Manual override (changes the active protocol)</label>
                         <select id="consensus" class="w-full p-2.5 text-sm rounded-lg bg-slate-50 border border-slate-200 outline-none focus:border-indigo-500">
                         </select>
                     </div>
                     <button onclick="triggerConsensus()" class="w-full py-3 rounded-lg bg-slate-900 text-white font-bold text-sm hover:bg-slate-800 transition-colors shadow-lg">
-                        Forge Current Block
+                        Forge Next Block (assigned protocol)
                     </button>
                     <button onclick="resolve()" class="w-full py-2 text-xs font-semibold text-slate-500 hover:text-indigo-600 transition-colors">
                         Synchronize Global State
+                    </button>
+                    <button onclick="verifyLedger()" class="w-full py-2 rounded-lg border border-slate-300 text-xs font-bold text-slate-700 hover:bg-slate-50 transition-colors">
+                        Verify Ledger Integrity
                     </button>
                 </div>
             </div>
@@ -2115,28 +2562,28 @@ INDEX_HTML = """
             <div>
                 <p class="text-xs uppercase tracking-widest font-bold text-emerald-700">Module 4</p>
                 <h2 class="text-2xl font-extrabold text-slate-900 mt-1">Explainable Dynamic Consensus</h2>
-                <p class="text-sm text-slate-500 mt-2 max-w-3xl">Explain why the existing dynamic-consensus mechanism selected its actual protocol. Module 4 observes that decision and does not select a different protocol.</p>
+                <p class="text-sm text-slate-500 mt-2 max-w-3xl">Explains the selector's prediction for the latest queued transaction, whether it was applied, and which protocol that transfer will be committed with. Module 4 never makes a second selection.</p>
             </div>
             <button onclick="loadConsensusExplanation()" class="shrink-0 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-bold px-4 py-2.5">Refresh explanation</button>
         </div>
 
         <div class="grid grid-cols-1 md:grid-cols-3 gap-3 mb-5">
-            <div class="rounded-xl border border-slate-200 bg-slate-50 p-4"><div class="text-xs uppercase tracking-wide font-bold text-slate-500">Dynamically selected protocol</div><div id="xai-consensus-selected" class="text-2xl font-extrabold text-emerald-700 mt-2">Analyzing…</div><div id="xai-consensus-reason" class="text-sm text-slate-700 mt-2 leading-relaxed">Loading explanation…</div></div>
-            <div class="rounded-xl border border-slate-200 p-4"><div class="text-xs uppercase tracking-wide font-bold text-slate-500">Currently selected protocol</div><div id="xai-current-consensus" class="text-2xl font-extrabold text-indigo-700 mt-2">—</div><div id="xai-current-status" class="text-sm text-slate-600 mt-2">Checking whether the captured selection matches the active protocol.</div></div>
-            <div class="rounded-xl border border-slate-200 p-4"><div class="text-xs uppercase tracking-wide font-bold text-slate-500">Transaction context</div><div class="grid grid-cols-2 gap-3 mt-3"><div><div class="text-xs text-slate-500">Fraud risk</div><div id="xai-risk" class="text-xl font-bold text-slate-900">—</div></div><div><div class="text-xs text-slate-500">Owner trust</div><div id="xai-trust" class="text-xl font-bold text-slate-900">—</div></div><div class="col-span-2"><div id="xai-network-summary" class="text-sm text-slate-600">Network metrics loading…</div><div id="xai-input-sources" class="text-xs text-slate-500 mt-2">Input provenance loading…</div></div></div></div>
+            <div class="rounded-xl border border-slate-200 bg-slate-50 p-4"><div class="text-xs uppercase tracking-wide font-bold text-slate-500">ML predicted protocol</div><div id="xai-consensus-selected" class="text-2xl font-extrabold text-emerald-700 mt-2">Analyzing…</div><div id="xai-consensus-reason" class="text-sm text-slate-700 mt-2 leading-relaxed">Loading explanation…</div></div>
+            <div class="rounded-xl border border-slate-200 p-4"><div class="text-xs uppercase tracking-wide font-bold text-slate-500">Protocol assigned to this transfer</div><div id="xai-current-consensus" class="text-2xl font-extrabold text-indigo-700 mt-2">—</div><div id="xai-current-status" class="text-sm text-slate-600 mt-2">Checking whether the captured selection matches the active protocol.</div></div>
+            <div class="rounded-xl border border-slate-200 p-4"><div class="text-xs uppercase tracking-wide font-bold text-slate-500">Transaction context</div><div class="grid grid-cols-2 gap-3 mt-3"><div><div class="text-xs text-slate-500">Fraud risk</div><div id="xai-risk" class="text-xl font-bold text-slate-900">—</div></div><div><div class="text-xs text-slate-500">Owner trust (rule-based)</div><div id="xai-trust" class="text-xl font-bold text-slate-900">—</div></div><div id="xai-trust-breakdown" class="col-span-2 text-[11px] text-slate-500 leading-relaxed"></div><div class="col-span-2"><div id="xai-network-summary" class="text-sm text-slate-600">Network metrics loading…</div><div id="xai-input-sources" class="text-xs text-slate-500 mt-2">Input provenance loading…</div></div></div></div>
         </div>
 
         <div class="grid grid-cols-1 xl:grid-cols-2 gap-5">
             <div class="rounded-xl border border-slate-200 p-4 md:p-5 min-w-0">
-                <h3 class="text-lg font-bold text-slate-900">Why this protocol was recommended</h3>
-                <p class="text-sm text-slate-500 mt-1 mb-4">These inputs are passed to the trained consensus-selection model; each input shows its source.</p>
+                <h3 class="text-lg font-bold text-slate-900">Selector inputs</h3>
+                <p class="text-sm text-slate-500 mt-1 mb-4">The exact feature vector given to the model, with each value's source and whether it is inside the training range.</p>
                 <div id="xai-consensus-factors" class="space-y-3"></div>
                 <div id="xai-consensus-algorithm" class="text-sm text-slate-700 bg-indigo-50 border border-indigo-100 rounded-lg p-4 mt-4 leading-relaxed"></div>
                 <div id="xai-consensus-note" class="text-xs text-slate-500 mt-3 leading-relaxed"></div>
             </div>
             <div class="rounded-xl border border-violet-200 bg-violet-50/40 p-4 md:p-5 min-w-0">
-                <h3 class="text-lg font-bold text-violet-950">Why the selected consensus was chosen — LIME</h3>
-                <p class="text-sm text-violet-800 mt-1">LIME locally approximates the trained consensus selector using representative project network-metrics rows.</p>
+                <h3 class="text-lg font-bold text-violet-950">Why the model predicted this class — LIME</h3>
+                <p class="text-sm text-violet-800 mt-1">Local surrogate weights for the predicted class. Weights show local influence, not probabilities or proof of optimality.</p>
                 <div id="xai-lime-target" class="text-sm font-semibold text-slate-800 mt-4">Waiting for explanation…</div>
                 <div id="xai-lime-features" class="space-y-3 mt-3"></div>
                 <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-4 text-xs text-slate-600"><div class="bg-white rounded-lg border border-violet-100 p-3"><strong>Positive weight</strong><p class="mt-1">Supports the selected class in the local surrogate.</p></div><div class="bg-white rounded-lg border border-violet-100 p-3"><strong>Negative weight</strong><p class="mt-1">Pushes against the selected class in the local surrogate.</p></div></div>
@@ -2145,7 +2592,7 @@ INDEX_HTML = """
         </div>
 
         <div class="mt-6">
-            <div class="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-2 mb-3"><div><h3 class="text-lg font-bold text-slate-900">Consensus protocol reference</h3><p class="text-sm text-slate-500 mt-1">Reference descriptions only. The highlighted protocol is the one selected by the existing dynamic-consensus pipeline.</p></div></div>
+            <div class="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-2 mb-3"><div><h3 class="text-lg font-bold text-slate-900">Consensus protocol reference</h3><p class="text-sm text-slate-500 mt-1">Reference descriptions only. Badges show the ML prediction and the active protocol separately.</p></div></div>
             <div id="xai-algorithm-options" class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3"><div class="text-sm text-slate-500">Loading protocol comparison…</div></div>
         </div>
     </section>
@@ -2159,7 +2606,7 @@ INDEX_HTML = """
             <div class="flex flex-wrap gap-2">
                 <input id="graph-postcode" class="p-2 text-xs rounded border border-slate-200" placeholder="Postcode filter (optional)">
                 <input id="graph-property" class="p-2 text-xs rounded border border-slate-200" placeholder="Property ID filter (optional)">
-                <button onclick="loadRealGraph({recentOnly:true})" class="bg-indigo-600 text-white px-4 py-2 rounded-lg text-xs font-bold">Show User Graph</button>
+                <button onclick="loadUserGraph()" class="bg-indigo-600 text-white px-4 py-2 rounded-lg text-xs font-bold" title="Your graph loads automatically; use this to return after searching other nodes">Back to My Graph</button>
             </div>
         </div>
         <div class="grid grid-cols-2 md:grid-cols-5 gap-2 mb-4 text-center text-xs">
@@ -2343,7 +2790,13 @@ function renderChain(chain, difficulty) {
         const verifiedClass = isVerified ? 'block-verified' : 'border-l-4 border-slate-200';
 
         const tx = block.transactions?.[0] || {};
-        const consensus = tx.predicted_consensus || block.consensus || 'N/A';
+        // Protocol that actually forged the block. Legacy blocks only had the old
+        // 'predicted_consensus' field, which also recorded the protocol that ran.
+        const consensus = block.consensus || tx.executed_consensus || tx.predicted_consensus || 'N/A';
+        const consensusNote = block.consensus ? 'Forged with' : (tx.predicted_consensus ? 'Forged with (legacy record)' : 'Forged with');
+        const mlNote = tx.ml_predicted_consensus
+            ? `<span class="text-[10px] py-1 px-2 bg-indigo-50 rounded text-indigo-700 font-bold">ML predicted ${tx.ml_predicted_consensus} · ${tx.ml_selection_applied ? 'applied' : 'not applied'}</span>`
+            : '';
 
         const landDetails = tx.old_owner ? `
             <div class="mt-3 grid grid-cols-2 gap-2 text-[11px] bg-slate-50 p-3 rounded border border-slate-100">
@@ -2397,12 +2850,14 @@ function renderChain(chain, difficulty) {
                 <div class="flex justify-between items-center mb-3">
                     <span class="font-bold text-slate-800">Block #${block.index}</span>
                     <span class="text-[10px] text-slate-400 font-mono">
-                        ${new Date((tx.timestamp || block.timestamp) * 1000).toLocaleString()}
+                        ${new Date(block.timestamp * 1000).toLocaleString()}
                     </span>
                 </div>
 
-                <div class="flex gap-2 mb-3">
+                <div class="flex flex-wrap gap-2 mb-3 items-center">
+                    <span class="text-[10px] text-slate-400 font-bold uppercase">${consensusNote}</span>
                     ${getConsensusTag(consensus)}
+                    ${mlNote}
                     <span class="text-[10px] py-1 px-2 bg-slate-100 rounded text-slate-600 font-bold uppercase">
                         Proposer: ${block.proposer || 'System'}
                     </span>
@@ -2509,6 +2964,19 @@ function renderPendingTx(txList) {
                         </p>
                     </div>
 
+                </div>
+
+                <div class="mt-2 text-[10px] text-slate-500">
+                    Owner trust: <b>${tx.trust_score != null ? Number(tx.trust_score).toFixed(1) + '/100' : '—'}</b>
+                    · Title: <b>${((tx.title_verification || {}).status || 'not checked').replaceAll('_', ' ')}</b>
+                </div>
+                <div class="mt-1 text-[10px] text-slate-500">
+                    Will commit with: <b>${tx.assigned_consensus || currentState.consensus_mode}</b>
+                    · ML prediction: <b>${tx.ml_predicted_consensus || tx.selected_consensus || '—'}</b>
+                    · ${tx.ml_selection_applied === true ? 'applied'
+                        : (tx.ml_selection_status || tx.consensus_selection_status || 'not evaluated').replaceAll('_', ' ')}
+                    ${tx.ml_model_version !== currentState.selector_model_version
+                        ? '<span class="text-amber-600">(decided by an earlier model version)</span>' : ''}
                 </div>
 
                 <button
@@ -3442,6 +3910,7 @@ function clearGraphSelection() {
 }
 
 function selectAndFocusGraphNode(nodeId) {
+    window.graphMode = 'explore';
     if (!latestRealGraph) return;
     const depth = parseInt(document.getElementById('graph-depth').value || '2', 10);
     renderConnectedNode(nodeId, depth);
@@ -3557,7 +4026,12 @@ function renderGraphNodeDetails(found, allNodes, allEdges) {
                     <div><span class="text-[9px] uppercase font-bold text-slate-400">Status</span>
                         <div class="font-semibold">${escapeHtml(label)}</div></div>
                     <div><span class="text-[9px] uppercase font-bold text-slate-400">Source</span>
-                        <div>${escapeHtml(found.source || '—')}</div></div>
+                        <div>${escapeHtml(found.blocked ? 'blocked by fraud screening' : (found.source || '—'))}</div></div>
+                    ${found.blockchain ? `
+                    <div><span class="text-[9px] uppercase font-bold text-slate-400">${found.source === 'pending' ? 'Will commit with' : 'Committed with'}</span>
+                        <div class="font-semibold">${escapeHtml(found.consensus || '—')}</div></div>
+                    <div><span class="text-[9px] uppercase font-bold text-slate-400">Owner trust</span>
+                        <div>${found.trust_score != null ? escapeHtml(Number(found.trust_score).toFixed(1)) + '/100' : '—'}</div></div>` : ''}
                 </div>
 
                 ${found.document_hash ? `
@@ -3655,6 +4129,7 @@ function renderConnectedNode(nodeId, depth = 2) {
         `Focused on “${found.label || found.id}” • ${nodes.length} nodes • ${edges.length} edges • ${depth}-hop neighbourhood`);
 }
 async function focusGraphNode() {
+    window.graphMode = 'explore';
     const query = document.getElementById('graph-search').value.trim();
     const status = document.getElementById('graph-search-status');
     const type = document.getElementById('graph-search-type').value;
@@ -3720,6 +4195,7 @@ async function loadRealGraph(options = {}) {
             document.getElementById('graph-search-status').textContent = target
                 ? `Showing ${options.focusType === 'Owner' ? 'User' : options.focusType} ${options.focusLabel} and its related transactions.`
                 : `No ${options.focusType || 'node'} named ${options.focusLabel} was found in the project transaction dataset.`;
+            return !!target;
         } else if (adminOnly) {
             document.getElementById('graph-search-status').textContent = 'Network/admin graph. Use only when you want to inspect blockchain network nodes.';
         } else {
@@ -3730,6 +4206,52 @@ async function loadRealGraph(options = {}) {
     } catch (err) {
         document.getElementById('graph-search-status').textContent = 'Graph loading failed: ' + err.message;
     }
+}
+
+// Opens the logged-in user's own graph: their owner node if the graph service has one,
+// otherwise every transaction (ledger, pending or blocked) where they are seller or buyer.
+// 'user' = showing the logged-in user's graph (auto-refreshes when the ledger changes);
+// 'explore' = the user searched or clicked into another node (left alone until "Show My Graph").
+window.graphMode = 'user';
+let lastLedgerSignature = null;
+
+function ledgerSignature(state) {
+    const pend = (state.pending_transactions || []).map(t => t.id).join(',');
+    return `${(state.chain || []).length}|${pend}|${(state.blocked_transactions || []).length}`;
+}
+
+async function loadUserGraph() {
+    window.graphMode = 'user';
+    const user = (currentState && currentState.current_user) || '';
+    if (!user || user === 'Guest') { await loadRealGraph({recentOnly:true}); return; }
+    document.getElementById('graph-search-type').value = 'Owner';
+    document.getElementById('graph-search').value = user;
+    // 2 hops: user -> their transactions -> land parcels, counterparties and blocks.
+    document.getElementById('graph-depth').value = '2';
+    const found = await loadRealGraph({focusType:'Owner', focusLabel:user, recentOnly:false});
+    if (found || !latestRealGraph) return;
+
+    const wanted = user.trim().toLowerCase();
+    const involves = n => [n.old_owner, n.seller, n.new_owner, n.buyer]
+        .some(v => String(v || '').trim().toLowerCase() === wanted);
+    const txIds = new Set(latestRealGraph.nodes
+        .filter(n => String(n.type || '').toLowerCase().includes('transaction') && involves(n))
+        .map(n => n.id));
+    const status = document.getElementById('graph-search-status');
+    if (!txIds.size) {
+        await loadRealGraph({recentOnly:true});
+        status.textContent = `No transactions recorded for ${user} yet. Showing recent records instead.`;
+        return;
+    }
+    const ids = new Set(txIds);
+    latestRealGraph.edges.forEach(e => {
+        if (txIds.has(e.source)) ids.add(e.target);
+        if (txIds.has(e.target)) ids.add(e.source);
+    });
+    const nodes = latestRealGraph.nodes.filter(n => ids.has(n.id));
+    const edges = latestRealGraph.edges.filter(e => ids.has(e.source) && ids.has(e.target));
+    window.graphFocusNodeId = null;
+    renderGraphSubset(nodes, edges, `${user}'s graph: ${txIds.size} transaction(s), ${nodes.length} connected nodes.`);
 }
 
 async function addGraphNode() {
@@ -3756,78 +4278,151 @@ async function addGraphNode() {
     }
 }
 
+function renderTrust(data) {
+    const t = data.owner_trust || null;
+    const score = data.trust_score ?? (t ? t.score : null);
+    document.getElementById('xai-trust').textContent = score == null ? 'Unavailable' : `${Number(score).toFixed(1)}/100${t ? ' · ' + t.level : ''}`;
+    const box = document.getElementById('xai-trust-breakdown');
+    if (!box) return;
+    if (!t || !Array.isArray(t.breakdown)) { box.textContent = ''; return; }
+    box.innerHTML = t.breakdown.map(b =>
+        `<div class="flex justify-between gap-2"><span>${escapeConsensusText(b.rule)}</span><span class="font-mono ${b.points < 0 ? 'text-rose-600' : 'text-slate-700'}">${b.points > 0 ? '+' : ''}${Number(b.points).toFixed(1)}</span></div>`
+    ).join('') + `<div class="mt-1 text-slate-400">${escapeConsensusText(t.method || '')}</div>`;
+}
+
+const PROTOCOL_INFO = {
+  'PoW': ['Proof of Work', 'Nodes compete through computational work. Expensive and generally a poor fit for a permissioned registry.'],
+  'PoS': ['Proof of Stake', 'Validators chosen by stake. Depends on staking and validator-selection assumptions.'],
+  'PBFT': ['Practical Byzantine Fault Tolerance', 'Known validators vote; tolerates f Byzantine nodes with n ≥ 3f+1. Message overhead grows with validator count.'],
+  'Raft': ['Raft', 'Leader-based, crash-fault tolerant only. Not designed for malicious (Byzantine) validators.'],
+  'HotStuff': ['HotStuff', 'Quorum-based BFT with chained phases and linear communication; same n ≥ 3f+1 assumption as PBFT.']
+};
+
+function renderProtocolReference(predicted, active, applied) {
+    document.getElementById('xai-algorithm-options').innerHTML = Object.keys(PROTOCOL_INFO).map(name => {
+      const info = PROTOCOL_INFO[name];
+      const isPred = name === predicted;
+      const isActive = name === active;
+      const badges = (isPred ? `<span class="rounded-full ${applied ? 'bg-emerald-100 text-emerald-800' : 'bg-amber-100 text-amber-800'} text-[10px] font-bold px-2 py-1">ML prediction${applied ? '' : ' (not applied)'}</span>` : '')
+                   + (isActive ? '<span class="rounded-full bg-indigo-100 text-indigo-800 text-[10px] font-bold px-2 py-1">Active</span>' : '');
+      return `<article class="rounded-xl border ${isActive ? 'border-indigo-300 bg-indigo-50/50' : (isPred ? 'border-amber-300 bg-amber-50/40' : 'border-slate-200 bg-white')} p-4">
+        <div class="flex items-start justify-between gap-2"><div><h4 class="font-bold text-slate-900">${escapeConsensusText(name)}</h4><p class="text-xs text-slate-500 mt-0.5">${escapeConsensusText(info[0])}</p></div><div class="flex flex-col gap-1 items-end">${badges}</div></div>
+        <p class="text-sm text-slate-600 leading-relaxed mt-3">${escapeConsensusText(info[1])}</p>
+      </article>`;
+    }).join('');
+}
+
 async function loadConsensusExplanation() {
     const selectedEl = document.getElementById('xai-consensus-selected');
     if (!selectedEl) return;
+    const el = id => document.getElementById(id);
+    const sourceLabels = {default: 'default', ml_selector: 'ML selector', manual_override: 'manual override'};
     try {
         const response = await fetch('/api/consensus/explanation', {headers: {'Accept': 'application/json'}});
         const data = await response.json();
         if (!response.ok) throw new Error(data.detail || data.error || 'Request failed');
-        if (data.error && !data.selected_consensus) {
-            selectedEl.textContent = 'Model not ready';
-            document.getElementById('xai-consensus-reason').textContent = data.error;
-            document.getElementById('xai-lime-target').textContent = 'LIME not run — no captured dynamic-consensus selection.';
-            document.getElementById('xai-lime-features').innerHTML = '';
-            document.getElementById('xai-consensus-note').textContent = 'Submit a transaction to trigger the existing dynamic-consensus selector, then refresh.';
+
+        el('xai-current-consensus').textContent = data.current_consensus || '—';
+        el('xai-risk').textContent = data.risk_score == null ? 'Unavailable' : `${Number(data.risk_score).toFixed(1)}%`;
+        renderTrust(data);
+
+        if (data.error) {
+            renderProtocolReference(data.selected_consensus, data.current_consensus, data.selection_applied === true);
+            selectedEl.textContent = data.selected_consensus || 'No decision';
+            el('xai-consensus-reason').textContent = data.error;
+            el('xai-current-status').textContent =
+                `Set by ${sourceLabels[data.consensus_source] || data.consensus_source || '—'}. ` +
+                `Last block forged with ${data.last_block_consensus || '—'}.`;
+            el('xai-lime-target').textContent = 'LIME not run — no captured decision to explain.';
+            el('xai-lime-features').innerHTML = '';
+            el('xai-consensus-factors').innerHTML = '';
+            el('xai-consensus-algorithm').textContent = '';
+            el('xai-network-summary').textContent = '';
+            el('xai-input-sources').textContent = '';
+            el('xai-consensus-note').textContent = 'Submit a land transfer to capture a selector decision.';
             return;
         }
+
+        const applied = data.selection_applied === true;
         selectedEl.textContent = data.selected_consensus || '—';
-        document.getElementById('xai-consensus-reason').textContent = data.reason || 'No reason available.';
-        document.getElementById('xai-current-consensus').textContent = data.current_consensus || '—';
-        document.getElementById('xai-current-status').textContent = data.selection_matches_current
-            ? 'The captured selection matches the active consensus mode.'
-            : `The captured selection and active protocol differ; check whether another authorized action changed the active mode.`;
-        document.getElementById('xai-risk').textContent = `${Number(data.risk_score || 0).toFixed(1)}%`;
-        document.getElementById('xai-trust').textContent = `${Number(data.trust_score || 0).toFixed(1)}/100`;
+        selectedEl.className = 'text-2xl font-extrabold mt-2 ' + (applied ? 'text-emerald-700' : 'text-amber-600');
+        el('xai-consensus-reason').textContent = data.reason || '';
+        const oor = Array.isArray(data.out_of_training_range) ? data.out_of_training_range : [];
+        el('xai-current-status').textContent = applied
+            ? `Prediction applied. This transfer will be committed with ${data.current_consensus}.`
+            : `Prediction NOT applied${oor.length ? ' (' + oor.map(o => o.feature).join(', ') + ' outside training range)' : ''}. ` +
+              `Active protocol stays ${data.current_consensus}, set by ${sourceLabels[data.consensus_source] || data.consensus_source}.`;
+        if (data.model_prediction_matches_captured === false) {
+            el('xai-current-status').textContent += ' Warning: the model no longer reproduces the captured prediction.';
+        }
+
         const net = data.network || {};
-        document.getElementById('xai-network-summary').textContent = `${net.active_nodes ?? '—'} application nodes · latency ${net.latency_ms ?? 'Unavailable'} ms · throughput ${net.throughput_tps ?? 'Unavailable'} TPS`;
-        const sourceMap = data.input_sources || {};
-        document.getElementById('xai-input-sources').textContent = 'Input sources: ' + Object.entries(sourceMap).map(([k, v]) => `${k}: ${v}`).join(' | ');
+        const req = (data.runtime_measurements || {}).request_processing_latency_ms;
+        el('xai-network-summary').textContent =
+            `${net.active_nodes ?? '—'} nodes · consensus round ${net.latency_ms ?? '—'} ms · ` +
+            `${(data.runtime_measurements || {}).committed_transactions_in_window ?? 0} commit(s) in last ${Math.round(((data.runtime_measurements || {}).window_seconds || 300) / 60)} min = ${Number(net.throughput_tps ?? 0).toFixed(4)} TPS` +
+            (req != null ? ` · full request ${Number(req).toFixed(0)} ms (diagnostic only)` : '');
+        el('xai-input-sources').textContent = '';
+
         const factors = Array.isArray(data.factors) ? data.factors : [];
-        document.getElementById('xai-consensus-factors').innerHTML = factors.map(item => `
-            <div class="rounded-lg border border-slate-200 bg-white p-3">
-                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-1"><strong class="text-sm text-slate-800">${escapeConsensusText(item.factor)}</strong><span class="text-sm font-bold text-slate-900">${escapeConsensusText(item.value)}</span></div>
+        const ranges = data.training_feature_ranges || {};
+        const featureKeys = ['node_count', 'network_latency_ms', 'tx_throughput_tps', 'security_risk_score', 'fault_tolerance_requirement'];
+        el('xai-consensus-factors').innerHTML = factors.map((item, i) => {
+            const r = ranges[featureKeys[i]];
+            const rangeText = r ? `Training range ${Number(r.training_min).toPrecision(4)} – ${Number(r.training_max).toPrecision(4)}` : '';
+            return `<div class="rounded-lg border ${item.out_of_range ? 'border-amber-300 bg-amber-50' : 'border-slate-200 bg-white'} p-3">
+                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-1">
+                    <strong class="text-sm text-slate-800">${escapeConsensusText(item.factor)}</strong>
+                    <span class="text-sm font-bold ${item.out_of_range ? 'text-amber-700' : 'text-slate-900'}">${escapeConsensusText(item.value)}</span>
+                </div>
+                <div class="text-[11px] mt-1 ${item.out_of_range ? 'text-amber-700 font-semibold' : 'text-slate-500'}">
+                    ${escapeConsensusText(rangeText)}${item.out_of_range ? ' · OUT OF RANGE' : ''} · ${escapeConsensusText(item.source_type || '')}
+                </div>
                 <p class="text-sm text-slate-600 mt-1.5 leading-relaxed">${escapeConsensusText(item.effect)}</p>
-            </div>`).join('') || '<div class="text-sm text-slate-500">No decision factors available.</div>';
-        document.getElementById('xai-consensus-algorithm').textContent = data.algorithm_explanation || '';
-        document.getElementById('xai-consensus-note').textContent = data.method_note || '';
+            </div>`;
+        }).join('') || '<div class="text-sm text-slate-500">No inputs recorded.</div>';
+
+        const probs = data.class_probabilities || {};
+        const probText = Object.entries(probs).sort((a, b) => b[1] - a[1])
+            .map(([k, v]) => `${k} ${(v * 100).toFixed(1)}%`).join(' · ');
+        el('xai-consensus-algorithm').textContent = (data.algorithm_explanation || '') +
+            (probText ? `\nModel class probabilities: ${probText}` : '');
+        el('xai-consensus-algorithm').style.whiteSpace = 'pre-line';
+        const mi = data.model_info || {};
+        el('xai-consensus-note').textContent = (data.method_note || '') +
+            (mi.training_source ? ` Model trained on: ${mi.training_source} data (${mi.rows_used ?? '?'} rows). ` +
+                (mi.independent_accuracy != null
+                    ? `Independent test set: ${(mi.independent_accuracy * 100).toFixed(1)}% on ${mi.independent_rows} unseen scenarios` +
+                      (mi.grouped_unseen_risk_accuracy != null ? `; unseen risk values: ${(mi.grouped_unseen_risk_accuracy * 100).toFixed(1)}%` : '') +
+                      `. Random-split score ${mi.test_accuracy != null ? (mi.test_accuracy * 100).toFixed(1) + '%' : '?'} is optimistic (same policy cells in train and test).`
+                    : `Independent evaluation not run (python benchmark_consensus.py --independent, then retrain); random-split score ${mi.test_accuracy != null ? (mi.test_accuracy * 100).toFixed(1) + '%' : '?'} is optimistic.`) +
+                ' The model reproduces the written benchmark policy; it is not proof of an optimal protocol.' : '');
+
         const lime = data.lime_explanation || {};
-        document.getElementById('xai-lime-target').textContent = `${lime.method || 'LIME'} · Explained class: ${lime.target_consensus || data.selected_consensus || '—'}`;
+        el('xai-lime-target').textContent = `${lime.method || 'LIME'} · Explained class: ${lime.target_consensus || data.selected_consensus || '—'}`;
         const limeFeatures = Array.isArray(lime.features) ? lime.features : [];
         const maxWeight = Math.max(0.0001, ...limeFeatures.map(item => Math.abs(Number(item.weight || 0))));
-        document.getElementById('xai-lime-features').innerHTML = limeFeatures.map(item => {
+        el('xai-lime-features').innerHTML = limeFeatures.map(item => {
             const weight = Number(item.weight || 0);
             const width = Math.max(2, Math.min(100, Math.abs(weight) / maxWeight * 100));
             const supports = weight >= 0;
             return `<div class="rounded-lg border border-violet-100 bg-white p-3">
                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-1"><strong class="text-sm text-slate-800">${escapeConsensusText(item.feature)}</strong><span class="text-sm font-bold ${supports ? 'text-emerald-700' : 'text-rose-700'}">${weight > 0 ? '+' : ''}${weight.toFixed(4)}</span></div>
                 <div class="h-2 bg-slate-100 rounded-full mt-2 overflow-hidden"><div class="h-full rounded-full ${supports ? 'bg-emerald-500' : 'bg-rose-500'}" style="width:${width}%"></div></div>
-                <div class="text-xs text-slate-500 mt-1.5">${escapeConsensusText(item.direction || (supports ? 'Supports selected class locally' : 'Opposes selected class locally'))}</div>
+                <div class="text-xs text-slate-500 mt-1.5">${escapeConsensusText(item.direction || '')}</div>
             </div>`;
-        }).join('') || '<div class="text-sm text-slate-500 bg-white rounded-lg p-3">LIME explanation unavailable. Check the Flask terminal for the underlying error.</div>';
-        document.getElementById('xai-lime-warning').textContent = lime.warning || lime.scope || '';
-        const options = data.algorithm_options || {};
-        const descriptions = {
-          'PoW': ['Proof of Work', 'Nodes compete through computational work. Strong historical use in public chains, but high energy and slower finality can be drawbacks.'],
-          'PoS': ['Proof of Stake', 'Validators are selected based on stake and protocol rules. Usually more energy-efficient than PoW; requires secure staking and slashing/governance design.'],
-          'PBFT': ['Practical Byzantine Fault Tolerance', 'Known validators exchange messages/votes and tolerate some Byzantine faults. Fast finality in small permissioned groups, but communication overhead grows with validator count.'],
-          'Raft': ['Raft', 'Leader-based crash-fault-tolerant consensus. Simple and efficient for trusted nodes, but it is not designed to tolerate malicious Byzantine validators.'],
-          'HotStuff': ['HotStuff', 'Quorum-based Byzantine-fault-tolerant protocol with chained phases. Designed for scalable BFT-style consensus, but implementation and validator assumptions matter.']
-        };
-        const actualSelection = data.selected_consensus;
-        document.getElementById('xai-algorithm-options').innerHTML = (data.algorithms || Object.keys(descriptions)).map(name => {
-          const info = descriptions[name] || [name, 'Protocol details are not available.'];
-          const chosen = name === actualSelection;
-          const policyReason = options[name] || (chosen ? data.reason : 'This protocol was not selected in the captured decision.');
-          return `<article class="rounded-xl border ${chosen ? 'border-emerald-300 bg-emerald-50/60' : 'border-slate-200 bg-white'} p-4">
-            <div class="flex items-start justify-between gap-2"><div><h4 class="font-bold text-slate-900">${escapeConsensusText(name)}</h4><p class="text-xs text-slate-500 mt-0.5">${escapeConsensusText(info[0])}</p></div>${chosen ? '<span class="shrink-0 rounded-full bg-emerald-100 text-emerald-800 text-[10px] font-bold px-2 py-1">Actually selected</span>' : ''}</div>
-            <p class="text-sm text-slate-600 leading-relaxed mt-3">${escapeConsensusText(info[1])}</p>
-            <div class="mt-3 border-t border-slate-100 pt-3"><div class="text-[10px] uppercase tracking-wide font-bold text-slate-500">Role in this decision</div><p class="text-sm text-slate-700 mt-1 leading-relaxed">${escapeConsensusText(policyReason)}</p></div>
-          </article>`;
-        }).join('');
+        }).join('') || '<div class="text-sm text-slate-500 bg-white rounded-lg p-3">LIME explanation unavailable. Check the Flask terminal.</div>';
+        el('xai-lime-warning').textContent = (oor.length
+            ? 'Inputs are outside the training range, so this prediction and its LIME weights are extrapolations. '
+            : '') + (lime.warning || '');
+
+        renderProtocolReference(data.selected_consensus, data.current_consensus, applied);
+        if (data.restored_from_ledger_state) {
+            el('xai-current-status').textContent += ' (Restored from saved ledger state after a server restart.)';
+        }
     } catch (error) {
         selectedEl.textContent = 'Explanation unavailable';
-        document.getElementById('xai-consensus-reason').textContent = error.message;
+        el('xai-consensus-reason').textContent = error.message;
     }
 }
 function escapeConsensusText(value) {
@@ -3843,7 +4438,24 @@ async function refresh() {
 
         document.getElementById('current-user').textContent = currentState.current_user;
         document.getElementById('current-consensus').innerHTML = getConsensusTag(currentState.consensus_mode);
-        document.getElementById('predicted-consensus').textContent = currentState.predicted_mode || 'Analyzing...';
+        const sourceLabels = {default: 'Default', ml_selector: 'ML selector', manual_override: 'Manual override'};
+        document.getElementById('consensus-source').textContent =
+            'Set by: ' + (sourceLabels[currentState.consensus_source] || currentState.consensus_source || '—');
+        document.getElementById('consensus-source').title = currentState.consensus_source_detail || '';
+        document.getElementById('last-block-consensus').textContent = currentState.last_block_consensus || '—';
+        document.getElementById('predicted-consensus').textContent = currentState.predicted_mode || 'None yet';
+        const trig = document.getElementById('prediction-trigger');
+        if (!currentState.predicted_mode) {
+            trig.textContent = (currentState.prediction_status || 'No prediction yet').replaceAll('_', ' ');
+            trig.className = 'mt-2 text-xs text-slate-500';
+        } else if (currentState.prediction_applied) {
+            trig.textContent = 'Applied as active protocol';
+            trig.className = 'mt-2 text-xs font-semibold text-emerald-700';
+        } else {
+            const feats = (currentState.prediction_out_of_range || []).join(', ');
+            trig.textContent = 'Not applied' + (feats ? ' — out of training range: ' + feats : '');
+            trig.className = 'mt-2 text-xs font-semibold text-amber-700';
+        }
         document.getElementById('difficulty').textContent = currentState.difficulty;
         document.getElementById('pending-tx-count').textContent = currentState.pending_transactions.length;
 
@@ -3860,6 +4472,14 @@ async function refresh() {
         renderPendingTx(currentState.pending_transactions);
         renderBlockedTx(currentState.blocked_transactions || []);
         renderGovernance(currentUsers);
+
+        // Keep the user's graph current: reload it whenever a block is forged or a
+        // transfer is queued/blocked (by this user or another officer).
+        const sig = ledgerSignature(currentState);
+        if (lastLedgerSignature !== null && sig !== lastLedgerSignature && window.graphMode === 'user') {
+            loadUserGraph();
+        }
+        lastLedgerSignature = sig;
         loadConsensusExplanation();
     } catch (e) { console.error("Refresh failed", e); }
 }
@@ -3918,13 +4538,8 @@ async function addLandTx() {
     if (j.transaction && (j.success || j.blocked)) {
         await refresh();
 
-        const txKey = j.transaction.id || j.transaction.transaction_id || j.transaction.land_id;
-        const txType = (j.transaction.id || j.transaction.transaction_id) ? 'Transaction' : 'Property';
-        await loadRealGraph({
-            focusType: txType,
-            focusLabel: txKey,
-            recentOnly: false
-        });
+        lastLedgerSignature = ledgerSignature(currentState);   // avoid a second reload
+        await loadUserGraph();
 
         document.getElementById('graph-search-status').textContent = j.blocked
             ? `Showing the blocked transaction: ${j.transaction.old_owner || currentState.current_user} → ${j.transaction.new_owner || newOwner}.`
@@ -3936,17 +4551,22 @@ async function addLandTx() {
 }
 
 async function triggerConsensus() {
-    const mode = document.getElementById('consensus').value;
-    await fetch('/api/set_consensus', {
-        method: 'POST', 
-        headers: { 'Content-Type': 'application/json' }, 
-        body: JSON.stringify({ mode })
-    });
+    // Forges with the ACTIVE protocol. Changing protocol is done only via the override dropdown.
     const r = await fetch('/api/trigger', { method: 'POST' });
     const j = await r.json();
     showMessage(j.success ? 'Block Forged' : 'Forging Failed', j.result, !j.success);
-    refresh();
-    loadRealGraph({recentOnly:false});
+    refresh();   // refresh() reloads the user's graph when the ledger changed
+}
+
+async function verifyLedger() {
+    const r = await fetch('/api/ledger/verify');
+    const j = await r.json();
+    const counts = {};
+    (j.blocks || []).forEach(b => { if (b.index > 0) counts[b.consensus || 'missing'] = (counts[b.consensus || 'missing'] || 0) + 1; });
+    const summary = Object.entries(counts).map(([k, v]) => `${k}: ${v}`).join(', ');
+    showMessage(j.valid ? 'Ledger Verified' : 'Ledger Integrity Problem',
+        j.valid ? `${j.blocks_checked} blocks, all hash links valid. Protocols recorded: ${summary}.`
+                : `Broken hash link at block(s): ${j.broken_links_at.join(', ')}.`, !j.valid);
 }
 
 async function resolve() {
@@ -3954,7 +4574,6 @@ async function resolve() {
     const j = await r.json();
     showMessage('Network Sync', j.message);
     refresh();
-    loadRealGraph({recentOnly:false});
 }
 
 async function voteUser(username) {
@@ -3970,19 +4589,23 @@ async function voteUser(username) {
 
 document.getElementById('consensus').addEventListener('change', async function(){
     const mode = this.value;
-    await fetch('/api/set_consensus', {
-        method:'POST', 
-        headers:{'content-type':'application/json'}, 
+    if (mode === currentState.consensus_mode) return;
+    if (!confirm(`Manually override the active protocol to ${mode}? This will be recorded as a manual override, not an ML decision.`)) {
+        this.value = currentState.consensus_mode;
+        return;
+    }
+    const r = await fetch('/api/set_consensus', {
+        method:'POST',
+        headers:{'content-type':'application/json'},
         body: JSON.stringify({mode})
     });
-    showMessage('Policy Updated', `Consensus protocol changed to ${mode}`);
+    const j = await r.json();
+    showMessage(j.success ? 'Manual Override' : 'Override Failed', j.message, !j.success);
     refresh();
 });
 
-refresh();
-// Load the user-facing mixed dataset graph immediately.
-// Admin/network nodes are available only through the dedicated admin API mode.
-loadRealGraph({recentOnly:true});
+// Show the logged-in user's own graph as soon as their identity is known.
+refresh().then(loadUserGraph);
 setInterval(refresh, 4000);
 </script>
 
@@ -3997,4 +4620,11 @@ if __name__ == '__main__':
     print("\n--- ConcordiaChain Simulator ---")
     print(f"Credentials loaded from: {CREDENTIALS_FILE}")
     print(f"Total Users: {len(USERS)}")
-    app.run(debug=True, use_reloader=False, threaded=False)
+    # threaded=False: the in-memory ledger is not safe for concurrent writers.
+    app.run(
+        host=os.environ.get("LAND_REGISTRY_HOST", "127.0.0.1"),
+        port=int(os.environ.get("LAND_REGISTRY_PORT", "5000")),
+        debug=os.environ.get("LAND_REGISTRY_DEBUG", "0") == "1",
+        use_reloader=False,
+        threaded=False,
+    )

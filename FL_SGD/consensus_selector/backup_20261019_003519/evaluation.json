@@ -1,0 +1,277 @@
+{
+  "trained_at": "2026-10-18T23:43:58",
+  "training_source": "historical",
+  "training_data_source": "C:\\proj\\land_reg\\Dataset\\Current_Network_Metrics.csv",
+  "features": [
+    "node_count",
+    "network_latency_ms",
+    "tx_throughput_tps",
+    "security_risk_score",
+    "fault_tolerance_requirement"
+  ],
+  "classes": [
+    "HotStuff",
+    "PBFT",
+    "PoS",
+    "PoW",
+    "Raft"
+  ],
+  "rows_used": 3600,
+  "class_counts": {
+    "PoW": 720,
+    "PoS": 720,
+    "Raft": 720,
+    "PBFT": 720,
+    "HotStuff": 720
+  },
+  "test_accuracy": 0.9013888888888889,
+  "classification_report": {
+    "HotStuff": {
+      "precision": 0.8125,
+      "recall": 0.8125,
+      "f1-score": 0.8125,
+      "support": 144.0
+    },
+    "PBFT": {
+      "precision": 0.8137931034482758,
+      "recall": 0.8194444444444444,
+      "f1-score": 0.8166089965397924,
+      "support": 144.0
+    },
+    "PoS": {
+      "precision": 0.9440559440559441,
+      "recall": 0.9375,
+      "f1-score": 0.9407665505226481,
+      "support": 144.0
+    },
+    "PoW": {
+      "precision": 0.9452054794520548,
+      "recall": 0.9583333333333334,
+      "f1-score": 0.9517241379310345,
+      "support": 144.0
+    },
+    "Raft": {
+      "precision": 0.9929577464788732,
+      "recall": 0.9791666666666666,
+      "f1-score": 0.986013986013986,
+      "support": 144.0
+    },
+    "accuracy": 0.9013888888888889,
+    "macro avg": {
+      "precision": 0.9017024546870296,
+      "recall": 0.9013888888888889,
+      "f1-score": 0.9015227342014922,
+      "support": 720.0
+    },
+    "weighted avg": {
+      "precision": 0.9017024546870295,
+      "recall": 0.9013888888888889,
+      "f1-score": 0.9015227342014923,
+      "support": 720.0
+    }
+  },
+  "confusion_matrix": [
+    [
+      117,
+      27,
+      0,
+      0,
+      0
+    ],
+    [
+      26,
+      118,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      135,
+      8,
+      1
+    ],
+    [
+      0,
+      0,
+      6,
+      138,
+      0
+    ],
+    [
+      1,
+      0,
+      2,
+      0,
+      141
+    ]
+  ],
+  "feature_ranges": {
+    "node_count": {
+      "min": 3.0,
+      "max": 40.0,
+      "p01": 3.0,
+      "p99": 38.0
+    },
+    "network_latency_ms": {
+      "min": 5.0,
+      "max": 1358.54,
+      "p01": 5.0,
+      "p99": 809.0793999999999
+    },
+    "tx_throughput_tps": {
+      "min": 1.0,
+      "max": 7319.06,
+      "p01": 1.0,
+      "p99": 4516.432599999998
+    },
+    "security_risk_score": {
+      "min": 0.038,
+      "max": 0.5362,
+      "p01": 0.066792,
+      "p99": 0.41030499999999986
+    },
+    "fault_tolerance_requirement": {
+      "min": 0.3197,
+      "max": 0.8691,
+      "p01": 0.359794,
+      "p99": 0.823103
+    }
+  },
+  "label_audit": {
+    "chance_accuracy": 0.2,
+    "per_feature": {
+      "node_count": {
+        "single_feature_cv_accuracy": 0.3814,
+        "range_by_class": {
+          "HotStuff": [
+            3.0,
+            23.0
+          ],
+          "PBFT": [
+            3.0,
+            26.0
+          ],
+          "PoS": [
+            3.0,
+            15.0
+          ],
+          "PoW": [
+            4.0,
+            37.0
+          ],
+          "Raft": [
+            3.0,
+            40.0
+          ]
+        }
+      },
+      "network_latency_ms": {
+        "single_feature_cv_accuracy": 0.4486,
+        "range_by_class": {
+          "HotStuff": [
+            5.0,
+            328.41
+          ],
+          "PBFT": [
+            5.0,
+            502.67
+          ],
+          "PoS": [
+            5.0,
+            295.55
+          ],
+          "PoW": [
+            5.0,
+            1358.54
+          ],
+          "Raft": [
+            5.0,
+            276.94
+          ]
+        }
+      },
+      "tx_throughput_tps": {
+        "single_feature_cv_accuracy": 0.3164,
+        "range_by_class": {
+          "HotStuff": [
+            1.0,
+            6452.29
+          ],
+          "PBFT": [
+            1.0,
+            1839.7
+          ],
+          "PoS": [
+            1.0,
+            2195.62
+          ],
+          "PoW": [
+            1.0,
+            361.94
+          ],
+          "Raft": [
+            1.0,
+            7319.06
+          ]
+        }
+      },
+      "security_risk_score": {
+        "single_feature_cv_accuracy": 0.2672,
+        "range_by_class": {
+          "HotStuff": [
+            0.038,
+            0.4498
+          ],
+          "PBFT": [
+            0.1032,
+            0.5362
+          ],
+          "PoS": [
+            0.0887,
+            0.4977
+          ],
+          "PoW": [
+            0.0393,
+            0.4314
+          ],
+          "Raft": [
+            0.0387,
+            0.5169
+          ]
+        }
+      },
+      "fault_tolerance_requirement": {
+        "single_feature_cv_accuracy": 0.6264,
+        "range_by_class": {
+          "HotStuff": [
+            0.6662,
+            0.8564
+          ],
+          "PBFT": [
+            0.6645,
+            0.8691
+          ],
+          "PoS": [
+            0.354,
+            0.5496
+          ],
+          "PoW": [
+            0.3197,
+            0.5106
+          ],
+          "Raft": [
+            0.5033,
+            0.7099
+          ]
+        }
+      }
+    },
+    "features_that_alone_predict_label": [
+      "fault_tolerance_requirement"
+    ],
+    "note": "A feature that alone predicts the label well suggests the label reflects how rows were generated. For the historical simulator, 'consensus' is the protocol that was being simulated, not a benchmark judgement of the best protocol."
+  },
+  "warning": "Trained on simulator output. Labels are the protocol each simulated row was generated for, not benchmark judgements. Feature scales (network latency, TPS) differ from this app's in-process measurements, so the app will reject most live predictions as out of range. Holdout accuracy measures agreement with the simulator, not real-world optimality."
+}

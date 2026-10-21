@@ -1,0 +1,109 @@
+{
+  "features": [
+    "node_count",
+    "network_latency_ms",
+    "tx_throughput_tps",
+    "security_risk_score",
+    "fault_tolerance_requirement"
+  ],
+  "classes": [
+    "HotStuff",
+    "PBFT",
+    "PoS",
+    "PoW",
+    "Raft"
+  ],
+  "rows_used": 3600,
+  "class_counts": {
+    "PoW": 720,
+    "PoS": 720,
+    "Raft": 720,
+    "PBFT": 720,
+    "HotStuff": 720
+  },
+  "test_accuracy": 0.9013888888888889,
+  "classification_report": {
+    "HotStuff": {
+      "precision": 0.8125,
+      "recall": 0.8125,
+      "f1-score": 0.8125,
+      "support": 144.0
+    },
+    "PBFT": {
+      "precision": 0.8137931034482758,
+      "recall": 0.8194444444444444,
+      "f1-score": 0.8166089965397924,
+      "support": 144.0
+    },
+    "PoS": {
+      "precision": 0.9440559440559441,
+      "recall": 0.9375,
+      "f1-score": 0.9407665505226481,
+      "support": 144.0
+    },
+    "PoW": {
+      "precision": 0.9452054794520548,
+      "recall": 0.9583333333333334,
+      "f1-score": 0.9517241379310345,
+      "support": 144.0
+    },
+    "Raft": {
+      "precision": 0.9929577464788732,
+      "recall": 0.9791666666666666,
+      "f1-score": 0.986013986013986,
+      "support": 144.0
+    },
+    "accuracy": 0.9013888888888889,
+    "macro avg": {
+      "precision": 0.9017024546870296,
+      "recall": 0.9013888888888889,
+      "f1-score": 0.9015227342014922,
+      "support": 720.0
+    },
+    "weighted avg": {
+      "precision": 0.9017024546870295,
+      "recall": 0.9013888888888889,
+      "f1-score": 0.9015227342014923,
+      "support": 720.0
+    }
+  },
+  "confusion_matrix": [
+    [
+      117,
+      27,
+      0,
+      0,
+      0
+    ],
+    [
+      26,
+      118,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      135,
+      8,
+      1
+    ],
+    [
+      0,
+      0,
+      6,
+      138,
+      0
+    ],
+    [
+      1,
+      0,
+      2,
+      0,
+      141
+    ]
+  ],
+  "training_data_source": "C:\\proj\\land_reg\\Dataset\\Current_Network_Metrics.csv",
+  "warning": "This evaluation is on historical CSV rows, not held-out live runtime measurements. The current app measures local application processing latency and application transaction rate; these may differ from the historical network-level feature distributions. Check the app's out-of-training-range warnings and collect representative measured benchmark data before claiming that dynamic consensus is validated or optimal."
+}

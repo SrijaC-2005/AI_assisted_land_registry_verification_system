@@ -1,18 +1,23 @@
-# Virtual Environment
+﻿# Virtual environments
 .venv/
 venv/
+.venv_broken/
 
 # Python
 __pycache__/
 *.py[cod]
 
-# Environment Variables
+# Secrets and credentials
+.secret_key
 .env
+.env.*
+!.env.example
+User_Credential.csv
 
-# VS Code
+# IDE
 .vscode/
 
-# Database
+# Databases
 *.db
 
 # Logs
@@ -22,6 +27,6 @@ __pycache__/
 dist/
 build/
 
-# OS Files
+# OS files
 .DS_Store
 Thumbs.db

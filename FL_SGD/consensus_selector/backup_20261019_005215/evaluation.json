@@ -1,0 +1,164 @@
+{
+  "trained_at": "2026-10-19T00:35:19",
+  "training_source": "benchmark",
+  "training_data_source": "C:\\proj\\land_reg\\Dataset\\Runtime_Consensus_Benchmarks.csv",
+  "features": [
+    "node_count",
+    "network_latency_ms",
+    "tx_throughput_tps",
+    "security_risk_score",
+    "fault_tolerance_requirement"
+  ],
+  "classes": [
+    "HotStuff",
+    "Raft"
+  ],
+  "rows_used": 4950,
+  "class_counts": {
+    "HotStuff": 3600,
+    "Raft": 1350
+  },
+  "test_accuracy": 1.0,
+  "classification_report": {
+    "HotStuff": {
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1-score": 1.0,
+      "support": 720.0
+    },
+    "Raft": {
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1-score": 1.0,
+      "support": 270.0
+    },
+    "accuracy": 1.0,
+    "macro avg": {
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1-score": 1.0,
+      "support": 990.0
+    },
+    "weighted avg": {
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1-score": 1.0,
+      "support": 990.0
+    }
+  },
+  "confusion_matrix": [
+    [
+      720,
+      0
+    ],
+    [
+      0,
+      270
+    ]
+  ],
+  "feature_ranges": {
+    "node_count": {
+      "min": 4.0,
+      "max": 10.0,
+      "p01": 4.0,
+      "p99": 10.0
+    },
+    "network_latency_ms": {
+      "min": 0.0084999919636175,
+      "max": 205.2747999987332,
+      "p01": 0.0091999972937628,
+      "p99": 159.49424999416806
+    },
+    "tx_throughput_tps": {
+      "min": 0.0,
+      "max": 0.3333333333333333,
+      "p01": 0.0,
+      "p99": 0.3333333333333333
+    },
+    "security_risk_score": {
+      "min": 0.02,
+      "max": 0.7,
+      "p01": 0.02,
+      "p99": 0.7
+    },
+    "fault_tolerance_requirement": {
+      "min": 0.5,
+      "max": 0.75,
+      "p01": 0.5,
+      "p99": 0.75
+    }
+  },
+  "label_audit": {
+    "chance_accuracy": 0.5,
+    "per_feature": {
+      "node_count": {
+        "single_feature_cv_accuracy": 0.7273,
+        "range_by_class": {
+          "HotStuff": [
+            4.0,
+            10.0
+          ],
+          "Raft": [
+            4.0,
+            10.0
+          ]
+        }
+      },
+      "network_latency_ms": {
+        "single_feature_cv_accuracy": 0.7253,
+        "range_by_class": {
+          "HotStuff": [
+            0.0084999919636175,
+            205.2747999987332
+          ],
+          "Raft": [
+            0.0084999919636175,
+            205.2747999987332
+          ]
+        }
+      },
+      "tx_throughput_tps": {
+        "single_feature_cv_accuracy": 0.7071,
+        "range_by_class": {
+          "HotStuff": [
+            0.0,
+            0.3333333333333333
+          ],
+          "Raft": [
+            0.0,
+            0.3333333333333333
+          ]
+        }
+      },
+      "security_risk_score": {
+        "single_feature_cv_accuracy": 0.7273,
+        "range_by_class": {
+          "HotStuff": [
+            0.02,
+            0.7
+          ],
+          "Raft": [
+            0.02,
+            0.25
+          ]
+        }
+      },
+      "fault_tolerance_requirement": {
+        "single_feature_cv_accuracy": 0.7727,
+        "range_by_class": {
+          "HotStuff": [
+            0.5,
+            0.75
+          ],
+          "Raft": [
+            0.5,
+            0.5
+          ]
+        }
+      }
+    },
+    "features_that_alone_predict_label": [],
+    "note": "A feature that alone predicts the label well suggests the label reflects how rows were generated. For the historical simulator, 'consensus' is the protocol that was being simulated, not a benchmark judgement of the best protocol."
+  },
+  "warning": "Holdout accuracy on benchmark-labelled runtime scenarios. Not proof of optimality; evaluate on independent loads before claiming the selector picks the best protocol."
+}
